@@ -9,10 +9,12 @@ namespace minidb {
 /// physical design in ARCHITECTURE.md is derived from this constant.
 inline constexpr std::size_t kPageSize = 4096;
 
-/// Magic number stored at offset 0 of page 0: the ASCII bytes "MIND".
-/// Page 0 is the only page that does not begin with a page_type byte, so that
-/// `file` and `xxd` can identify the database at a glance.
-inline constexpr std::uint32_t kMagicNumber = 0x4D494E44;
+/// Magic number stored at offset 0 of page 0. The value is chosen so that,
+/// written little-endian like everything else, the first four bytes of the file
+/// read as the ASCII characters 'M' 'I' 'N' 'D'. Page 0 is the only page that
+/// does not begin with a page_type byte, precisely so that `file` and `xxd` can
+/// identify the database at a glance.
+inline constexpr std::uint32_t kMagicNumber = 0x444E494D;
 
 /// Bumped whenever the on-disk layout changes incompatibly.
 inline constexpr std::uint16_t kFormatVersion = 1;
