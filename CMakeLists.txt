@@ -44,7 +44,8 @@ add_library(minidb_core
     src/buffer/lru_replacer.cpp
     src/buffer/buffer_pool_manager.cpp
     src/catalog/catalog.cpp
-    src/storage/table_heap.cpp)
+    src/storage/table_heap.cpp
+    src/index/hash_index.cpp)
 
 target_include_directories(minidb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(minidb_core PUBLIC minidb_warnings minidb_sanitizers)
@@ -61,7 +62,8 @@ if(MINIDB_BUILD_TESTS)
         tests/disk_manager_test.cpp
         tests/table_page_test.cpp
         tests/buffer_pool_test.cpp
-        tests/table_heap_test.cpp)
+        tests/table_heap_test.cpp
+        tests/hash_index_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)
         get_filename_component(test_name ${test_source} NAME_WE)
