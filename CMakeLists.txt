@@ -42,7 +42,9 @@ add_library(minidb_core
     src/storage/table_page.cpp
     src/catalog/schema.cpp
     src/buffer/lru_replacer.cpp
-    src/buffer/buffer_pool_manager.cpp)
+    src/buffer/buffer_pool_manager.cpp
+    src/catalog/catalog.cpp
+    src/storage/table_heap.cpp)
 
 target_include_directories(minidb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(minidb_core PUBLIC minidb_warnings minidb_sanitizers)
@@ -58,13 +60,18 @@ if(MINIDB_BUILD_TESTS)
         tests/serialization_test.cpp
         tests/disk_manager_test.cpp
         tests/table_page_test.cpp
-        tests/buffer_pool_test.cpp)
+        tests/buffer_pool_test.cpp
+        tests/table_heap_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)
         get_filename_component(test_name ${test_source} NAME_WE)
         add_executable(${test_name} ${test_source})
         target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(${test_name} PRIVATE minidb_core GTest::gtest_main)
-        gtest_discover_tests(${test_name})
+        # PRE_TEST enumerates the cases when ctest runs rather than at build
+        # time. The default POST_BUILD mode races with parallel builds and can
+        # silently register a stale, partial list of tests, which would hide
+        # failures.
+        gtest_discover_tests(${test_name} DISCOVERY_MODE PRE_TEST)
     endforeach()
 endif()
