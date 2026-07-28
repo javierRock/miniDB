@@ -4,22 +4,13 @@
 #include <cstdint>
 #include <span>
 #include <string>
-#include <variant>
 #include <vector>
 
 #include "minidb/catalog/schema.hpp"
 #include "minidb/common/types.hpp"
+#include "minidb/common/value.hpp"
 
 namespace minidb {
-
-/// A single column value. INT and VARCHAR are the only supported types.
-using Value = std::variant<std::int32_t, std::string>;
-
-[[nodiscard]] std::string ValueToString(const Value& value);
-
-/// Compares two values of the same type. Strings compare byte by byte, so the
-/// ordering is UTF-8 code-unit order rather than a linguistic collation.
-[[nodiscard]] bool CompareValues(const Value& left, CompareOperator op, const Value& right);
 
 /// A row: one Value per column, in schema order.
 ///

@@ -37,6 +37,7 @@ endif()
 
 add_library(minidb_core
     src/common/serialization.cpp
+    src/common/value.cpp
     src/storage/disk_manager.cpp
     src/storage/record.cpp
     src/storage/table_page.cpp
@@ -45,7 +46,9 @@ add_library(minidb_core
     src/buffer/buffer_pool_manager.cpp
     src/catalog/catalog.cpp
     src/storage/table_heap.cpp
-    src/index/hash_index.cpp)
+    src/index/hash_index.cpp
+    src/parser/tokenizer.cpp
+    src/parser/parser.cpp)
 
 target_include_directories(minidb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(minidb_core PUBLIC minidb_warnings minidb_sanitizers)
@@ -63,7 +66,8 @@ if(MINIDB_BUILD_TESTS)
         tests/table_page_test.cpp
         tests/buffer_pool_test.cpp
         tests/table_heap_test.cpp
-        tests/hash_index_test.cpp)
+        tests/hash_index_test.cpp
+        tests/parser_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)
         get_filename_component(test_name ${test_source} NAME_WE)
