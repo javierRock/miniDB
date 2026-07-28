@@ -37,7 +37,10 @@ endif()
 
 add_library(minidb_core
     src/common/serialization.cpp
-    src/storage/disk_manager.cpp)
+    src/storage/disk_manager.cpp
+    src/storage/record.cpp
+    src/storage/table_page.cpp
+    src/catalog/schema.cpp)
 
 target_include_directories(minidb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(minidb_core PUBLIC minidb_warnings minidb_sanitizers)
@@ -51,7 +54,8 @@ if(MINIDB_BUILD_TESTS)
     # component that broke.
     set(MINIDB_TEST_SOURCES
         tests/serialization_test.cpp
-        tests/disk_manager_test.cpp)
+        tests/disk_manager_test.cpp
+        tests/table_page_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)
         get_filename_component(test_name ${test_source} NAME_WE)
