@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libgtest-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # The storage layer manipulates raw offsets inside 4096-byte buffers, so
+      # the sanitizer run is where an off-by-one in the slot directory shows up.
+      - name: Build with sanitizers
+        run: |
+          cmake -S . -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug -DMINIDB_ENABLE_SANITIZERS=ON
+          cmake --build build-sanitize -j"$(nproc)"
+
+      - name: Test with sanitizers
+        run: ctest --test-dir build-sanitize --output-on-failure
+
+      - name: Demo and on-disk evidence
+        run: |
+          bash scripts/demo.sh
+          bash scripts/inspect_database.sh
+
+      # The layering rules the design rests on. Each of these must find nothing.
+      - name: Check architectural invariants
+        run: |
+          set -e
+          check() {
+            if eval "$1" ; then
+              echo "VIOLACIÓN: $2"
+              exit 1
+            fi
+            echo "OK: $2"
+          }
+          check "grep -rqn 'DiskManager\|fstream' src/storage/table_heap.cpp src/index/ src/catalog/" \
+                "la tabla, el índice y el catálogo no tocan el disco directamente"
+          check "sed 's,//.*,,' include/minidb/index/hash_index.hpp | grep -qE 'unordered_map|vector<|map<'" \
+                "el índice hash no guarda entradas en RAM"
+          check "grep -rqn 'BufferPoolManager\|DiskManager' include/minidb/execution/" \
+                "los operadores no conocen el buffer pool ni el disco"
+          check "grep -rn 'kFileHeaderPageId' src/ | grep -qv disk_manager.cpp" \
+                "solo el DiskManager toca la página 0"
+          check "grep -rqn 'minidb/storage/\|minidb/buffer/\|minidb/index/' include/minidb/parser/ src/parser/" \
+                "el parser no depende del almacenamiento"

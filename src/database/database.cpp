@@ -92,7 +92,7 @@ Database::~Database() {
 void Database::OpenExistingTable() {
     heap_ = std::make_unique<TableHeap>(*pool_, *catalog_);
     index_ = std::make_unique<HashIndex>(*pool_, catalog_->IndexHeaderPageId());
-    engine_ = std::make_unique<ExecutionEngine>(*pool_, *catalog_, *heap_, *index_);
+    engine_ = std::make_unique<ExecutionEngine>(*catalog_, *heap_, *index_);
 }
 
 QueryResult Database::CreateTable(const CreateTableStatement& statement) {

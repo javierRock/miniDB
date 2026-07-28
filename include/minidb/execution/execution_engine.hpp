@@ -37,8 +37,8 @@ struct QueryResult {
 /// invalidate the very offsets the scan is walking.
 class ExecutionEngine {
 public:
-    ExecutionEngine(BufferPoolManager& pool, Catalog& catalog, TableHeap& heap, HashIndex& index)
-        : pool_(pool), catalog_(catalog), heap_(heap), index_(index) {}
+    ExecutionEngine(Catalog& catalog, TableHeap& heap, HashIndex& index)
+        : catalog_(catalog), heap_(heap), index_(index) {}
 
     [[nodiscard]] QueryResult Execute(const Statement& statement);
 
@@ -69,7 +69,6 @@ private:
     /// Operator names from the root down, walked through Child().
     [[nodiscard]] static std::vector<std::string> DescribePlan(const PhysicalOperator& root);
 
-    BufferPoolManager& pool_;
     Catalog& catalog_;
     TableHeap& heap_;
     HashIndex& index_;

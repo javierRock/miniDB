@@ -10,10 +10,11 @@
 namespace minidb {
 namespace {
 
-/// Spanish plural agreement for the result messages.
+/// Spanish plural agreement for the result messages: "1 fila insertada." but
+/// "3 filas insertadas."
 std::string RowsMessage(std::uint64_t count, const std::string& participle) {
     return std::to_string(count) + (count == 1 ? " fila " : " filas ") + participle +
-           (count == 1 ? "" : "s");
+           (count == 1 ? "" : "s") + ".";
 }
 
 }  // namespace
@@ -102,7 +103,7 @@ QueryResult ExecutionEngine::ExecuteInsert(const InsertStatement& statement) {
 
     QueryResult result;
     result.affected_rows = 1;
-    result.message = "1 fila insertada.";
+    result.message = RowsMessage(1, "insertada");
     return result;
 }
 

@@ -56,6 +56,9 @@ add_library(minidb_core
 target_include_directories(minidb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(minidb_core PUBLIC minidb_warnings minidb_sanitizers)
 
+add_executable(minidb src/main.cpp)
+target_link_libraries(minidb PRIVATE minidb_core)
+
 if(MINIDB_BUILD_TESTS)
     find_package(GTest REQUIRED)
     enable_testing()
