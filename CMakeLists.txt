@@ -51,6 +51,8 @@ add_library(minidb_core
     src/parser/parser.cpp
     src/execution/operators.cpp
     src/execution/blocking_operators.cpp
+    src/execution/record_batch.cpp
+    src/execution/vectorized_operators.cpp
     src/execution/execution_engine.cpp
     src/database/database.cpp)
 
@@ -78,6 +80,7 @@ if(MINIDB_BUILD_TESTS)
         tests/volcano_test.cpp
         tests/blocking_operators_test.cpp
         tests/evaluation_test.cpp
+        tests/vectorized_test.cpp
         tests/integration_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)

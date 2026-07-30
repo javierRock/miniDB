@@ -23,6 +23,9 @@ namespace minidb {
 struct DatabaseConfig {
     std::filesystem::path data_file = "data/minidb.db";
     std::size_t buffer_pool_frames = kDefaultBufferPoolFrames;
+    /// Whether full scans start in batch-at-a-time mode. Off by default; see
+    /// ExecutionEngine::SetVectorizedEnabled.
+    bool vectorized = false;
 
     /// Reads a config file. Missing files are not an error: the defaults above
     /// are used. Throws QueryError on a malformed or out-of-range value.
@@ -38,7 +41,8 @@ class Database {
 public:
     /// Opens `path`, creating and initialising it when it does not exist.
     explicit Database(std::filesystem::path path,
-                      std::size_t buffer_pool_frames = kDefaultBufferPoolFrames);
+                      std::size_t buffer_pool_frames = kDefaultBufferPoolFrames,
+                      bool vectorized = false);
 
     /// Flushes everything. Doing it here means a redirected script that simply
     /// reaches end of input still persists its work.
@@ -70,6 +74,11 @@ public:
     void SetIndexEnabled(bool enabled);
     [[nodiscard]] bool IndexEnabled() const;
 
+    /// Whether full scans run batch-at-a-time. See
+    /// ExecutionEngine::SetVectorizedEnabled.
+    void SetVectorizedEnabled(bool enabled);
+    [[nodiscard]] bool VectorizedEnabled() const;
+
 private:
     /// The statement itself, without the measuring. Execute wraps it.
     [[nodiscard]] QueryResult ExecuteParsed(const std::string& sql);
@@ -77,6 +86,9 @@ private:
     void OpenExistingTable();
 
     std::filesystem::path path_;
+    /// Kept here as well as in the engine, because CREATE TABLE builds a new
+    /// engine and the setting has to survive that.
+    bool vectorized_ = false;
     std::unique_ptr<DiskManager> disk_;
     std::unique_ptr<BufferPoolManager> pool_;
     std::unique_ptr<Catalog> catalog_;

@@ -9,6 +9,8 @@
 #include "minidb/execution/projection_operator.hpp"
 #include "minidb/execution/sequential_scan_operator.hpp"
 #include "minidb/execution/sort_operator.hpp"
+#include "minidb/execution/vectorized_filter_operator.hpp"
+#include "minidb/execution/vectorized_scan_operator.hpp"
 
 namespace minidb {
 namespace {
@@ -44,6 +46,17 @@ std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildScan(
     if (CanUseIndex(where)) {
         return std::make_unique<IndexScanOperator>(heap_, index_,
                                                    std::get<std::int32_t>(where->value));
+    }
+
+    // The two execution models differ only here: same plan shape, same order,
+    // batch-at-a-time operators instead of tuple-at-a-time ones.
+    if (vectorized_enabled_) {
+        auto scan = std::make_unique<VectorizedScanOperator>(heap_);
+        if (!where.has_value()) {
+            return scan;
+        }
+        return std::make_unique<VectorizedFilterOperator>(std::move(scan), catalog_.GetSchema(),
+                                                          *where);
     }
 
     auto scan = std::make_unique<SequentialScanOperator>(heap_);

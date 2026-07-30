@@ -93,7 +93,11 @@ void PrintPlan(const QueryResult& result) {
         // the tree reads in the direction the records travel: bottom to top.
         const std::string branch = (i == 0) ? "  " : std::string(2 * i, ' ') + "└─ ";
         std::cout << Pad(branch + op.name, 40) << "filas=" << op.rows_produced
-                  << "  next=" << op.next_calls << '\n';
+                  << "  next=" << op.next_calls;
+        if (op.batches_produced > 0) {
+            std::cout << "  lotes=" << op.batches_produced;
+        }
+        std::cout << '\n';
     }
 }
 
@@ -125,8 +129,10 @@ Comandos internos:
   .buffer   Frames del Buffer Pool y estadísticas
   .files    Archivos en disco y su tamaño
   .flush    Sincroniza todas las páginas sucias
-  .indice [on|off]  Activa o desactiva el uso del índice (para medir)
-  .bench [n]        Compara n búsquedas por clave con y sin índice
+  .indice [on|off]      Activa o desactiva el uso del índice (para medir)
+  .vectorizado [on|off] Cambia entre ejecución tupla a tupla y por lotes
+  .bench [n]            Compara n búsquedas por clave con y sin índice
+  .benchvec [n]         Compara los dos modelos de ejecución
   .exit     Sincroniza y sale
 
 Ejemplos:
@@ -338,6 +344,119 @@ void RunBenchmark(Database& db, std::size_t queries) {
             argument_start == std::string::npos ? "" : command.substr(argument_start)};
 }
 
+void RunVectorizedCommand(Database& db, const std::string& argument) {
+    if (argument == "on") {
+        db.SetVectorizedEnabled(true);
+    } else if (argument == "off") {
+        db.SetVectorizedEnabled(false);
+    } else if (!argument.empty()) {
+        std::cout << "Uso: .vectorizado [on|off]\n";
+        return;
+    }
+
+    if (db.VectorizedEnabled()) {
+        std::cout << "Ejecución vectorizada por lotes: ACTIVADA\n"
+                     "Los escaneos completos usan VectorizedScanOperator (una fijación de\n"
+                     "página por página, no por registro) y VectorizedFilterOperator\n"
+                     "(comparación sobre columna contigua y vector de selección).\n";
+    } else {
+        std::cout << "Ejecución vectorizada por lotes: desactivada\n"
+                     "Los escaneos completos usan el camino Volcano tupla a tupla.\n";
+    }
+}
+
+/// Compares the two execution models on the same full-scan query.
+///
+/// The query, the data and the buffer pool are identical in both rounds; the only
+/// difference is whether the planner builds the batch-at-a-time operators.
+void RunVectorizedBenchmark(Database& db, std::size_t repetitions) {
+    if (!db.HasTable()) {
+        std::cout << "No hay ninguna tabla que medir. Use CREATE TABLE e inserte filas.\n";
+        return;
+    }
+
+    const Catalog& catalog = db.GetCatalog();
+    const Schema& schema = catalog.GetSchema();
+
+    // A filter over an INT column that is not the primary key: the shape that
+    // forces a full scan and lets the comparison be vectorized.
+    std::string filter_column;
+    for (std::size_t i = 0; i < schema.ColumnCount(); ++i) {
+        if (schema.GetColumn(i).type == ColumnType::kInteger && i != schema.PrimaryKeyIndex()) {
+            filter_column = schema.GetColumn(i).name;
+            break;
+        }
+    }
+    if (filter_column.empty()) {
+        std::cout << "La tabla no tiene ninguna columna INT que no sea la clave primaria,\n"
+                     "así que no hay una consulta con filtro vectorizable que medir.\n";
+        return;
+    }
+
+    // A predicate that keeps roughly nothing, so the cost measured is the scan
+    // and the comparison rather than the assembly of the result.
+    const std::string sql =
+        "SELECT * FROM " + catalog.TableName() + " WHERE " + filter_column + " < -1";
+
+    struct Round {
+        const char* label;
+        bool vectorized;
+        double elapsed_ms = 0.0;
+        std::uint64_t next_calls = 0;
+        std::uint64_t batches = 0;
+        std::uint64_t buffer_accesses = 0;
+    };
+    Round rounds[] = {{"Volcano tupla a tupla", false}, {"Vectorizado por lotes", true}};
+
+    const bool restore = db.VectorizedEnabled();
+    for (Round& round : rounds) {
+        db.SetVectorizedEnabled(round.vectorized);
+        for (std::size_t i = 0; i < repetitions; ++i) {
+            const QueryResult result = db.Execute(sql);
+            round.elapsed_ms += result.elapsed_ms;
+            round.buffer_accesses += result.buffer_hits + result.buffer_misses;
+            for (const OperatorMetrics& op : result.metrics) {
+                round.next_calls += op.next_calls;
+                round.batches += op.batches_produced;
+            }
+        }
+    }
+    db.SetVectorizedEnabled(restore);
+
+    std::cout << "Comparación de los dos modelos de ejecución\n"
+              << "Consulta: " << sql << '\n'
+              << "Tabla: " << catalog.RecordCount() << " registros en " << db.TablePageCount()
+              << " páginas   " << repetitions << " repeticiones\n\n";
+
+    const std::string separator =
+        "+-------------------------+-------------+-------------+------------+---------------+";
+    std::cout << separator << '\n'
+              << "| modelo                  | tiempo      | por consulta| lotes      "
+                 "| accesos al BP |\n"
+              << separator << '\n';
+    for (const Round& round : rounds) {
+        std::cout << "| " << Pad(round.label, 23) << " | "
+                  << Pad(std::format("{:.3f} ms", round.elapsed_ms), 11) << " | "
+                  << Pad(std::format("{:.4f} ms",
+                                     round.elapsed_ms / static_cast<double>(repetitions)),
+                         11)
+                  << " | " << Pad(std::to_string(round.batches), 10) << " | "
+                  << Pad(std::to_string(round.buffer_accesses), 13) << " |\n";
+    }
+    std::cout << separator << '\n';
+
+    const Round& tuple = rounds[0];
+    const Round& vector = rounds[1];
+    std::cout << "\nLlamadas a Next() en total: " << tuple.next_calls << " tupla a tupla frente a "
+              << vector.next_calls << " vectorizado.\n"
+              << "Accesos al Buffer Pool: " << tuple.buffer_accesses << " frente a "
+              << vector.buffer_accesses << " (el escaneo por lotes fija cada página una vez,\n"
+                 "no una vez por registro).\n";
+    if (vector.elapsed_ms > 0.0) {
+        std::cout << std::format("Aceleración: {:.2f}x.\n", tuple.elapsed_ms / vector.elapsed_ms);
+    }
+}
+
 void RunIndexCommand(Database& db, const std::string& argument) {
     if (!db.HasTable()) {
         std::cout << "No hay ninguna tabla definida.\n";
@@ -383,17 +502,23 @@ bool RunInternalCommand(const std::string& full_command, Database& db,
         std::cout << "Páginas sincronizadas con el disco.\n";
     } else if (command == ".indice") {
         RunIndexCommand(db, argument);
-    } else if (command == ".bench") {
-        std::size_t queries = 100;
+    } else if (command == ".vectorizado") {
+        RunVectorizedCommand(db, argument);
+    } else if (command == ".bench" || command == ".benchvec") {
+        std::size_t repetitions = command == ".bench" ? 100 : 20;
         if (!argument.empty()) {
             const auto* first = argument.data();
             const auto* last = first + argument.size();
-            if (std::from_chars(first, last, queries).ec != std::errc{} || queries == 0) {
-                std::cout << "Uso: .bench [número de consultas]\n";
+            if (std::from_chars(first, last, repetitions).ec != std::errc{} || repetitions == 0) {
+                std::cout << "Uso: " << command << " [número de repeticiones]\n";
                 return true;
             }
         }
-        RunBenchmark(db, queries);
+        if (command == ".bench") {
+            RunBenchmark(db, repetitions);
+        } else {
+            RunVectorizedBenchmark(db, repetitions);
+        }
     } else {
         std::cout << "Comando desconocido: " << command << ". Use .help\n";
     }
@@ -488,7 +613,7 @@ int main(int argc, char** argv) {
             config.data_file = argv[1];
         }
 
-        Database db(config.data_file, config.buffer_pool_frames);
+        Database db(config.data_file, config.buffer_pool_frames, config.vectorized);
 
         const bool interactive = ::isatty(0) != 0;
         if (interactive) {
@@ -496,6 +621,10 @@ int main(int argc, char** argv) {
                       << "Archivo: " << std::filesystem::absolute(db.Path()).string() << '\n'
                       << "Tamaño de página: " << kPageSize << " bytes\n"
                       << "Frames del Buffer Pool: " << db.Pool().FrameCount() << '\n'
+                      << "Ejecución: "
+                      << (db.VectorizedEnabled() ? "vectorizada por lotes"
+                                                 : "Volcano tupla a tupla")
+                      << " (cámbiela con .vectorizado on|off)\n"
                       << (db.HasTable()
                               ? "Tabla existente: " + db.GetCatalog().TableName() + " (" +
                                     std::to_string(db.GetCatalog().RecordCount()) + " registros)\n"

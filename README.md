@@ -25,6 +25,7 @@ solo para las pruebas.
 - [Buffer Pool](#buffer-pool)
 - [Índice hash](#índice-hash)
 - [Modelo Volcano](#modelo-volcano)
+- [Ejecución vectorizada](#ejecución-vectorizada)
 - [Evaluación de rendimiento](#evaluación-de-rendimiento)
 - [Archivos en disco](#archivos-en-disco)
 - [Limitaciones](#limitaciones)
@@ -49,6 +50,10 @@ El detalle técnico completo —offsets, invariantes y diagramas— está en
 - **Procesamiento de consultas**: tokenizador y parser descendente recursivo
   propios, y seis operadores físicos componibles, incluidos `ORDER BY` y
   `GROUP BY` como operadores bloqueantes.
+- **Ejecución vectorizada**: además del camino Volcano tupla a tupla, un camino
+  por lotes en el que `NextBatch` mueve ~1024 registros de una vez, el escaneo
+  fija cada página una sola vez y el filtro compara sobre una columna contigua
+  con instrucciones SIMD. Los dos conviven y se pueden comparar.
 - **Medición del coste**: cada sentencia informa de su plan con contadores por
   operador, del tiempo empleado y de las páginas leídas del disco.
 - **Evaluación con y sin índice**: `.bench` resuelve el mismo lote de búsquedas
@@ -152,7 +157,9 @@ bash scripts/inspect_database.sh
 | `.files` | Rutas y tamaños de los archivos en disco |
 | `.flush` | Sincroniza todas las páginas sucias |
 | `.indice [on\|off]` | Activa o desactiva el uso del índice, para medir su efecto |
+| `.vectorizado [on\|off]` | Cambia entre ejecución tupla a tupla y por lotes |
 | `.bench [n]` | Compara `n` búsquedas por clave con y sin índice |
+| `.benchvec [n]` | Compara los dos modelos de ejecución sobre la misma consulta |
 | `.exit` | Sincroniza y sale |
 
 Evaluación de rendimiento con y sin índice, sobre su propia base de datos:
@@ -167,7 +174,7 @@ bash scripts/benchmark.sh
 ctest --test-dir build --output-on-failure
 ```
 
-Más de 230 casos repartidos en diez binarios, uno por componente. Cada prueba
+Más de 260 casos repartidos en once binarios, uno por componente. Cada prueba
 usa su propio archivo temporal y lo borra al terminar, así que no comparten
 estado y pueden ejecutarse en cualquier orden.
 
@@ -183,6 +190,7 @@ estado y pueden ejecutarse en cualquier orden.
 | `volcano_test` | `Open`/`Next`/`Close`, elección de plan, streaming |
 | `blocking_operators_test` | `ORDER BY` y `GROUP BY`: orden, estabilidad, grupos, fijaciones |
 | `evaluation_test` | Contadores por operador, tiempo, páginas leídas, con y sin índice |
+| `vectorized_test` | Lotes, vector de selección, equivalencia de los dos modelos |
 | `integration_test` | Ciclo completo, consistencia tabla-índice, configuración |
 
 ## SQL soportado
@@ -373,6 +381,130 @@ primero recorren el plan y recogen las posiciones, lo cierran, y solo entonces
 modifican. Reescribir páginas mientras un escaneo sigue recorriéndolas
 invalidaría los offsets de los que depende.
 
+## Ejecución vectorizada
+
+El modelo Volcano mueve **una tupla** por llamada. Eso lo hace fácil de entender y
+de componer, pero cada registro paga una llamada virtual por nivel del plan, y en
+este sistema paga además una fijación de página en el Buffer Pool: el iterador del
+*heap* fija la página, lee un slot, la suelta, y la vuelve a fijar para el
+siguiente. En una página con 90 registros son 90 accesos donde bastaría uno.
+
+La ejecución vectorizada —lo que hicieron MonetDB/X100 y Vectorwise— mueve un
+**lote** de ~1024 registros por llamada. Está implementada como un segundo camino
+que convive con el primero:
+
+```
+                          NextBatch()                 Next()
+  tupla a tupla    SequentialScanOperator      FilterOperator
+  por lotes        VectorizedScanOperator      VectorizedFilterOperator
+```
+
+Tres cosas cambian, y las tres se pueden medir:
+
+1. **Una fijación de página por página, no por registro.** `VectorizedScanOperator`
+   pide la página al Buffer Pool una vez y deserializa todos sus registros vivos.
+2. **Un vector de selección en lugar de copiar.** `VectorizedFilterOperator` no
+   mueve ningún registro: reescribe la lista de posiciones que sobrevivieron al
+   predicado. Los registros se quedan donde el escaneo los dejó.
+3. **La comparación se convierte en SIMD.** Los valores de la columna del filtro
+   se copian a un array contiguo y se comparan en un bucle sin ramas ni llamadas
+   indirectas, que el compilador traduce a instrucciones que comparan cuatro
+   valores a la vez.
+
+**El interfaz Volcano no cambia.** Los operadores por lotes siguen siendo
+operadores físicos con `Open`, `Next` y `Close`. Lo que hay son dos adaptadores de
+diez líneas cada uno:
+
+- `PhysicalOperator::NextBatch` por defecto llama a `Next()` hasta llenar el lote,
+  así que **cualquier** operador puede participar en un plan vectorizado sin
+  reescribirse.
+- `BatchOperator::Next` sirve un registro del lote que tiene en la mano, así que un
+  operador vectorizado puede colocarse debajo de uno que no sabe nada de lotes.
+
+Por eso `ORDER BY` y `GROUP BY`, que son tupla a tupla, funcionan tal cual encima
+de un escaneo vectorizado.
+
+### Cómo usarla y qué se gana
+
+Está **desactivada por defecto**: los operadores tupla a tupla son la
+implementación de referencia del modelo Volcano sobre el que está construido el
+sistema, y tener los dos caminos disponibles es justo lo que permite medir uno
+contra el otro. Se activa con `.vectorizado on`, o con `vectorized = true` en
+`minidb.conf`.
+
+```
+minidb> SELECT * FROM students WHERE age >= 20;
+Plan físico (modelo Volcano):
+  ProjectionOperator                    filas=75  next=76
+  └─ FilterOperator                     filas=75  next=76
+    └─ SequentialScanOperator           filas=3000  next=3001
+
+minidb> .vectorizado on
+minidb> SELECT * FROM students WHERE age >= 20;
+Plan físico (modelo Volcano):
+  ProjectionOperator                    filas=75  next=76
+  └─ VectorizedFilterOperator           filas=75  next=76  lotes=3
+    └─ VectorizedScanOperator           filas=3000  next=0  lotes=3
+```
+
+`.benchvec [n]` compara los dos modelos sobre la misma consulta:
+
+```
++-------------------------+-------------+-------------+------------+---------------+
+| modelo                  | tiempo      | por consulta| lotes      | accesos al BP |
++-------------------------+-------------+-------------+------------+---------------+
+| Volcano tupla a tupla   | 218.368 ms  | 10.9184 ms  | 0          | 60360         |
+| Vectorizado por lotes   | 99.699 ms   | 4.9849 ms   | 60         | 360           |
++-------------------------+-------------+-------------+------------+---------------+
+
+Llamadas a Next() en total: 60060 tupla a tupla frente a 40 vectorizado.
+Accesos al Buffer Pool: 60360 frente a 360.
+Aceleración: 2.19x.
+```
+
+3000 registros, 20 repeticiones, compilación Debug. Las dos cifras que no dependen
+de la máquina son las importantes: **60060 llamadas a `Next()` se convierten en 40**
+y **60360 accesos al Buffer Pool en 360**.
+
+### Comprobar que realmente hay SIMD
+
+El bucle de comparación solo se convierte en instrucciones vectoriales con
+optimización, así que la compilación `Debug` **no** las tiene. Se puede comprobar:
+
+```bash
+g++ -std=c++20 -O3 -Iinclude -c src/execution/vectorized_operators.cpp -o /tmp/simd.o
+objdump -d /tmp/simd.o | grep -cE 'pcmpgtd|pcmpeqd'      # 15
+```
+
+`scripts/benchmark.sh` hace esa comprobación y muestra el fragmento generado.
+Tres detalles del código son los que lo hacen posible, y los tres son fáciles de
+perder por accidente:
+
+- El predicado es un **parámetro de plantilla**, no un `enum` en tiempo de
+  ejecución, así que se inlinea y el cuerpo del bucle es una sola comparación.
+- La máscara de resultados es `int32_t`, **no** `uint8_t` ni `bool`. Una escritura
+  a través de un tipo tipo `char` puede aliasar cualquier objeto, y con la máscara
+  de bytes el compilador no podía descartar que escribir un byte modificara el
+  siguiente valor a leer: no vectorizaba nada. Cuatro bytes por bandera es un
+  precio barato.
+- Los punteros son `__restrict`, que afirma que los dos arrays no se solapan.
+
+### Límites honestos
+
+- La aceleración en tiempo es de **1.5x a 2.2x**, no de un orden de magnitud. El
+  coste que domina un escaneo aquí es **deserializar** cada registro —cada
+  `VARCHAR` construye un `std::string`— y eso lo paga igual el camino por lotes.
+  Quitarlo exigiría almacenamiento columnar, que cambiaría el formato del archivo.
+- La proyección y los operadores bloqueantes siguen siendo tupla a tupla. Se puede
+  ver como el trabajo que queda, o como la demostración de que los dos modelos
+  conviven: la parte vectorizada rinde igual con ellos encima.
+- Un `VARCHAR` no se puede vectorizar: los valores son de longitud variable y
+  están en offsets dispersos. El filtro lo detecta y compara registro a registro
+  dentro del lote, que aun así ahorra la llamada virtual por registro.
+- Una búsqueda por clave primaria **no** se vectoriza: no hay nada que agrupar en
+  recuperar una sola fila, así que el planificador deja el camino del índice
+  intacto.
+
 ## Evaluación de rendimiento
 
 Cada sentencia informa de lo que costó:
@@ -434,7 +566,7 @@ Dos matices que el propio comando señala:
 | Archivo | Qué es |
 |---|---|
 | `data/minidb.db` | Base de datos completa: cabecera, catálogo, datos, índice y overflow |
-| `minidb.conf` | Configuración en texto: archivo de datos y número de frames |
+| `minidb.conf` | Configuración en texto: archivo de datos, número de frames y modelo de ejecución |
 | `data/bench.db` | Solo si se ejecuta `scripts/benchmark.sh`: base independiente para la evaluación |
 
 El sistema no genera archivos temporales. `ORDER BY` y `GROUP BY` sí son

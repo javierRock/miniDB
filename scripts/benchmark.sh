@@ -68,7 +68,37 @@ SQL
 echo
 
 echo "=============================================================="
-echo " 5. Estado del Buffer Pool tras la evaluación"
+echo " 5. Comparación de los dos modelos de ejecución"
+echo "=============================================================="
+"$BINARY" "$DB" <<SQL
+.benchvec $QUERIES
+SQL
+echo
+
+echo "=============================================================="
+echo " 6. El filtro vectorizado compila a instrucciones SIMD"
+echo "=============================================================="
+# El bucle de comparación solo se convierte en SIMD con optimización: la
+# compilación Debug del resto del script es -O0. Se compila aparte para que la
+# afirmación se pueda comprobar en lugar de creerse.
+OBJECT="build/simd-check.o"
+if g++ -std=c++20 -O3 -Iinclude -c src/execution/vectorized_operators.cpp -o "$OBJECT" 2>/dev/null; then
+    COUNT=$(objdump -d "$OBJECT" | grep -cE 'pcmpgtd|pcmpeqd|vpcmpgtd|vpcmpeqd' || true)
+    echo "Instrucciones de comparación empaquetada (pcmpgtd/pcmpeqd) con -O3: $COUNT"
+    echo
+    echo "Muestra del bucle generado:"
+    objdump -d "$OBJECT" | grep -E 'pcmpgtd|pcmpeqd' | head -4
+    rm -f "$OBJECT"
+    if [ "$COUNT" -eq 0 ]; then
+        echo "AVISO: el compilador no vectorizó el bucle de comparación."
+    fi
+else
+    echo "No se pudo compilar la comprobación; se omite."
+fi
+echo
+
+echo "=============================================================="
+echo " 7. Estado del Buffer Pool tras la evaluación"
 echo "=============================================================="
 "$BINARY" "$DB" <<'SQL'
 .buffer

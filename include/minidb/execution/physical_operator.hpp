@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "minidb/execution/record_batch.hpp"
 #include "minidb/storage/record.hpp"
 
 namespace minidb {
@@ -19,6 +20,10 @@ struct OperatorMetrics {
     std::string name;
     std::uint64_t next_calls = 0;
     std::uint64_t rows_produced = 0;
+    /// Batches handed out, when the operator ran vectorized. Comparing this
+    /// against next_calls is the clearest picture of what batching buys: the same
+    /// rows delivered in a handful of calls instead of one per record.
+    std::uint64_t batches_produced = 0;
 };
 
 /// Base class of every physical operator, following the Volcano model.
@@ -44,6 +49,16 @@ public:
 
     /// Produces the next record, or std::nullopt when there are no more.
     [[nodiscard]] virtual std::optional<Record> Next() = 0;
+
+    /// Fills `batch` with the next block of records. Returns false at the end of
+    /// the input; a batch with nothing selected is not the end.
+    ///
+    /// This is the vectorized face of the same operator. The default
+    /// implementation pulls Next() until the batch reaches its target size, so
+    /// **every** operator can take part in a vectorized plan without being
+    /// rewritten, and a plan can be vectorized only in the part where it pays.
+    /// Operators that have a genuinely batched implementation override it.
+    virtual bool NextBatch(RecordBatch& batch);
 
     /// Releases resources. Calling it twice is harmless.
     virtual void Close() = 0;
@@ -81,7 +96,7 @@ public:
     /// What this operator did. The counters accumulate over its lifetime, and
     /// since a plan is built fresh for each statement, that is per statement.
     [[nodiscard]] OperatorMetrics Metrics() const {
-        return OperatorMetrics{Name(), next_calls_, rows_produced_};
+        return OperatorMetrics{Name(), next_calls_, rows_produced_, batches_produced_};
     }
 
 protected:
@@ -98,9 +113,28 @@ protected:
         return record;
     }
 
+    /// Counts one batch and the rows it carried. The batch equivalent of
+    /// Counted, so a vectorized operator reports in the same terms.
+    void CountBatch(std::size_t rows) {
+        ++batches_produced_;
+        rows_produced_ += rows;
+    }
+
+    /// Counts a Next() call whose record was already counted when its batch was
+    /// produced.
+    ///
+    /// Used by BatchOperator: serving a batch record by record must not count the
+    /// same rows a second time, or a vectorized operator driven from above by a
+    /// tuple-at-a-time one would report twice the rows it produced.
+    [[nodiscard]] std::optional<Record> CountedCall(std::optional<Record> record) {
+        ++next_calls_;
+        return record;
+    }
+
 private:
     std::uint64_t next_calls_ = 0;
     std::uint64_t rows_produced_ = 0;
+    std::uint64_t batches_produced_ = 0;
 };
 
 }  // namespace minidb

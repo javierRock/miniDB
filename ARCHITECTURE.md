@@ -76,6 +76,8 @@ graph TD
 | `PhysicalOperator` y derivados | Modelo Volcano, y los contadores de cada operador | `execution/*` |
 | `SequentialScan`, `IndexScan`, `Filter`, `Projection` | Operadores en flujo | `execution/operators.cpp` |
 | `SortOperator`, `AggregateOperator` | Operadores bloqueantes (`ORDER BY`, `GROUP BY`) | `execution/blocking_operators.cpp` |
+| `RecordBatch` | Lote de registros y su vector de selección | `execution/record_batch.*` |
+| `BatchOperator`, `VectorizedScanOperator`, `VectorizedFilterOperator` | Camino de ejecución por lotes | `execution/vectorized_operators.cpp` |
 | `ExecutionEngine` | Elegir el plan y aplicar las modificaciones | `execution/execution_engine.*` |
 | `Database` | Ensamblar todo, ejecutar sentencias, sincronizar al cerrar | `database/database.*` |
 
@@ -424,6 +426,75 @@ ordenación externa por mezcla, que volcaría los tramos ordenados a archivos
 temporales, sería el paso siguiente; no está implementada, y es la razón por la
 que el sistema sigue sin generar archivos temporales.
 
+### SELECT vectorizado
+
+Con `.vectorizado on`, un escaneo completo se resuelve con
+`VectorizedScanOperator` y `VectorizedFilterOperator` en lugar de sus equivalentes
+tupla a tupla. La forma del plan y el orden de los operadores son idénticos; lo que
+cambia es la unidad que viaja entre ellos.
+
+**Lo que viaja.** Un `RecordBatch` de unos 1024 registros más un **vector de
+selección**: la lista de posiciones que siguen vivas. El filtro no copia ni mueve
+ningún registro, solo reescribe esa lista, así que los registros se quedan donde el
+escaneo los dejó durante toda la vida del lote.
+
+`RecordBatch::kTargetSize` es un objetivo, no un máximo. El escaneo llena el lote
+página completa a página completa y se detiene al alcanzarlo, de modo que el último
+puede pasarse por hasta los registros de una página. Aceptar eso es lo que permite
+que el estado del operador sea **solo** «qué página viene después»: si el límite
+fuera estricto habría que recordar una posición en mitad de una página, que es
+justo donde un escaneo por lotes acumularía sus errores.
+
+**De dónde sale la ganancia.** No principalmente de la CPU:
+
+| | tupla a tupla | por lotes |
+|---|---|---|
+| Fijaciones de página en el Buffer Pool | una **por registro** | una **por página** |
+| Llamadas virtuales | una por registro y nivel | una por lote y nivel |
+| Comparación del filtro | una por registro, sobre un `Value` | cuatro por instrucción, sobre `int32_t` contiguos |
+
+La primera fila es la que más pesa, y es específica de este diseño:
+`TableHeap::Iterator` fija la página, lee un slot y la suelta, deliberadamente,
+para que un árbol de operadores no pueda agotar el pool. El escaneo por lotes usa
+`TableHeap::ForEachRecordInPage`, que la fija una sola vez.
+
+**Los dos adaptadores.** El interfaz Volcano no se toca: los operadores por lotes
+tienen `Open`, `Next` y `Close` como los demás. La convivencia se resuelve con dos
+piezas de diez líneas:
+
+- `PhysicalOperator::NextBatch` por defecto llama a `Next()` hasta llenar el lote.
+  Cualquier operador puede entrar en un plan vectorizado sin reescribirse.
+- `BatchOperator::Next` reparte el lote que tiene en la mano de uno en uno. Un
+  operador vectorizado puede colocarse debajo de uno que ignora los lotes — que es
+  lo que ocurre con `SortOperator` y `AggregateOperator` encima de un escaneo
+  vectorizado.
+
+`BatchOperator::NextBatch` se deja **abstracta** a propósito: si una subclase no la
+implementara, heredaría el adaptador que llama a `Next()`, y `Next()` llama a
+`NextBatch()` — los dos adaptadores se llamarían para siempre. Dejarla pura
+convierte ese error en un error de compilación.
+
+**Qué no se vectoriza, y por qué.**
+
+- La **búsqueda por clave primaria**: recuperar una fila no tiene nada que agrupar.
+- Un predicado sobre **`VARCHAR`**: los valores son de longitud variable y viven en
+  offsets dispersos, así que no hay array que comparar. El filtro lo detecta en el
+  constructor y compara registro a registro dentro del lote.
+- La **proyección** y los operadores **bloqueantes**. El motor materializa el
+  resultado en `QueryResult::rows` de todas formas, así que la cima del plan no es
+  donde el agrupamiento paga; paga en la hoja (fijaciones de página) y en el filtro
+  (comparaciones). Un sistema real gana también arriba porque escribe a un socket.
+- El paso de **selección** que sigue a la comparación: convertir una máscara en una
+  lista de posiciones depende de cuántos bits se pusieron antes, así que es
+  secuencial por naturaleza. Los sistemas reales usan una instrucción de
+  compactación SIMD; aquí es un bucle normal, y la comparación es la parte que
+  vectoriza.
+
+**Y qué frena la aceleración**: deserializar cada registro. Cada `VARCHAR`
+construye un `std::string`, y eso lo paga igual el camino por lotes. Es la razón de
+que la mejora en tiempo sea de 1.5x-2.2x y no de un orden de magnitud, y quitarlo
+exigiría almacenamiento columnar, es decir otro formato de archivo.
+
 ### Coste de cada sentencia
 
 Cada operador cuenta cuántas veces se tiró de él y cuántas filas entregó. Lo hace
@@ -514,3 +585,6 @@ inesperado).
 | `ORDER BY` y `GROUP BY` materializan en RAM | Una ordenación externa por mezcla es el paso siguiente, no un requisito: con una tabla acotada por el disco de un trabajo académico el vector siempre cabe, y el algoritmo externo triplicaría el código del operador |
 | Solo `COUNT(*)` como agregado | `MIN`, `MAX` y `SUM` reutilizarían la misma estructura sin añadir ningún concepto nuevo al bucle de agregación |
 | Interruptor para desactivar el índice | Comparar el rendimiento con y sin índice exige que todo lo demás sea idéntico. Un `bool` en el planificador es la forma más pequeña de conseguirlo; no es un modo de operación |
+| La ejecución vectorizada está desactivada por defecto | Los operadores tupla a tupla son la implementación de referencia del modelo Volcano sobre el que está construido el sistema. Tener los dos caminos vivos y probados es además lo que permite medir uno contra el otro en lugar de argumentarlo |
+| No hay almacenamiento columnar | Es lo que haría que la vectorización rindiera de verdad, porque eliminaría la deserialización por registro. Pero cambiaría el formato del archivo, las páginas ranuradas y el índice: sería otro proyecto, no una mejora de este |
+| Un lote puede pasarse de `kTargetSize` | Cortar en el límite exacto obligaría al escaneo a recordar una posición dentro de una página. Permitir el exceso deja su estado en un solo `PageId` |

@@ -65,6 +65,35 @@ public:
 
     [[nodiscard]] Iterator Begin() const { return Iterator(*this, catalog_.FirstTablePageId()); }
 
+    [[nodiscard]] PageId FirstPageId() const { return catalog_.FirstTablePageId(); }
+
+    /// Visits every live record of one page and returns the next page in the
+    /// chain, or kInvalidPageId at the end.
+    ///
+    /// The page is fetched **once**, whereas Iterator fetches it again for every
+    /// record it returns. That is the whole reason a batch-at-a-time scan is
+    /// cheaper: it pays one buffer pool round trip per page instead of one per
+    /// record. The visitor form lets the caller fill its own container without an
+    /// intermediate copy and without the storage layer knowing what that
+    /// container is.
+    template <typename Visitor>
+    [[nodiscard]] PageId ForEachRecordInPage(PageId page_id, Visitor&& visit) const {
+        if (page_id == kInvalidPageId) {
+            return kInvalidPageId;
+        }
+
+        PageGuard guard = FetchGuarded(pool_, page_id);
+        const TablePage page(guard.Data());
+        const Schema& schema = catalog_.GetSchema();
+
+        for (std::optional<SlotId> slot = page.NextOccupiedSlot(0); slot.has_value();
+             slot = page.NextOccupiedSlot(static_cast<SlotId>(*slot + 1))) {
+            const auto bytes = page.GetRecord(*slot);
+            visit(RecordId{page_id, *slot}, Record::DeserializeFrom(schema, *bytes));
+        }
+        return page.NextPageId();
+    }
+
     /// Counts live records by scanning. Used to check the catalog's cached
     /// counter has not drifted.
     [[nodiscard]] std::uint64_t CountRecordsByScan() const;

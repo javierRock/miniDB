@@ -66,6 +66,19 @@ public:
     void SetIndexEnabled(bool enabled) { index_enabled_ = enabled; }
     [[nodiscard]] bool IndexEnabled() const { return index_enabled_; }
 
+    /// Switches the scan and the filter to their batch-at-a-time implementations.
+    ///
+    /// Off by default, for two reasons. The tuple-at-a-time operators stay the
+    /// reference implementation of the Volcano model the system is built on, and
+    /// having both paths available is what allows the comparison between them to
+    /// be measured rather than argued.
+    ///
+    /// A point lookup through the index is left alone: there is nothing to
+    /// vectorize in fetching a single row, so vectorization only replaces the
+    /// operators of a full scan.
+    void SetVectorizedEnabled(bool enabled) { vectorized_enabled_ = enabled; }
+    [[nodiscard]] bool VectorizedEnabled() const { return vectorized_enabled_; }
+
     /// Builds the physical plan for a SELECT without running it. Exposed so the
     /// tests can assert which plan was chosen.
     [[nodiscard]] std::unique_ptr<PhysicalOperator> BuildPlan(const SelectStatement& select) const;
@@ -103,6 +116,7 @@ private:
     HashIndex& index_;
     /// Only ever false while measuring; see SetIndexEnabled.
     bool index_enabled_ = true;
+    bool vectorized_enabled_ = false;
 };
 
 }  // namespace minidb

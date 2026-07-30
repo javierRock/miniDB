@@ -59,6 +59,13 @@ SELECT * FROM students WHERE id = 9;
 SELECT * FROM students WHERE id = 9;
 .indice on
 
+-- Los dos modelos de ejecución sobre el mismo escaneo con filtro. Compare el
+-- número de llamadas a Next() y de accesos al Buffer Pool en los dos planes.
+SELECT * FROM students WHERE age >= 20;
+.vectorizado on
+SELECT * FROM students WHERE age >= 20;
+.vectorizado off
+
 .schema
 .pages
 .buffer

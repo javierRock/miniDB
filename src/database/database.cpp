@@ -59,6 +59,12 @@ DatabaseConfig DatabaseConfig::Load(const std::filesystem::path& path) {
                                  ": buffer_pool_frames debe ser un entero mayor que cero");
             }
             config.buffer_pool_frames = frames;
+        } else if (key == "vectorized") {
+            if (value != "true" && value != "false") {
+                throw QueryError("Línea " + std::to_string(line_number) + " de " + path.string() +
+                                 ": vectorized debe ser 'true' o 'false'");
+            }
+            config.vectorized = value == "true";
         } else {
             throw QueryError("Línea " + std::to_string(line_number) + " de " + path.string() +
                              ": opción desconocida '" + key + "'");
@@ -67,8 +73,8 @@ DatabaseConfig DatabaseConfig::Load(const std::filesystem::path& path) {
     return config;
 }
 
-Database::Database(std::filesystem::path path, std::size_t buffer_pool_frames)
-    : path_(std::move(path)) {
+Database::Database(std::filesystem::path path, std::size_t buffer_pool_frames, bool vectorized)
+    : path_(std::move(path)), vectorized_(vectorized) {
     disk_ = std::make_unique<DiskManager>(path_);
     pool_ = std::make_unique<BufferPoolManager>(*disk_, buffer_pool_frames);
 
@@ -94,6 +100,7 @@ void Database::OpenExistingTable() {
     heap_ = std::make_unique<TableHeap>(*pool_, *catalog_);
     index_ = std::make_unique<HashIndex>(*pool_, catalog_->IndexHeaderPageId());
     engine_ = std::make_unique<ExecutionEngine>(*catalog_, *heap_, *index_);
+    engine_->SetVectorizedEnabled(vectorized_);
 }
 
 QueryResult Database::CreateTable(const CreateTableStatement& statement) {
@@ -176,6 +183,15 @@ bool Database::IndexEnabled() const {
     // With no table there is no index either, so nothing can be using one.
     return engine_ != nullptr && engine_->IndexEnabled();
 }
+
+void Database::SetVectorizedEnabled(bool enabled) {
+    vectorized_ = enabled;
+    if (engine_ != nullptr) {
+        engine_->SetVectorizedEnabled(enabled);
+    }
+}
+
+bool Database::VectorizedEnabled() const { return vectorized_; }
 
 std::uint32_t Database::TablePageCount() const {
     return heap_ == nullptr ? 0 : heap_->PageCountInChain();
