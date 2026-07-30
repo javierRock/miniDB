@@ -47,6 +47,12 @@ jobs:
       - name: Performance evaluation with and without index
         run: BENCH_ROWS=600 BENCH_QUERIES=25 bash scripts/benchmark.sh
 
+      # End-to-end check that similarity search works and that the two ranking
+      # strategies agree. Reduced volume: what matters in CI is that it runs, not
+      # that it reproduces the figures from the article.
+      - name: Vector similarity search demo
+        run: VEC_ROWS=500 VEC_DIM=16 bash scripts/demo_vectorial.sh
+
       # The vectorized filter is only vectorized if the compiler says so, and the
       # Debug build cannot show it. This fails if the loop stops being SIMD, which
       # is easy to break by accident: a byte-sized mask is enough to do it.

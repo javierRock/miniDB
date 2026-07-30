@@ -70,3 +70,9 @@ SELECT * FROM students WHERE age >= 20;
 .pages
 .buffer
 .files
+
+-- ---------------------------------------------------------------------------
+-- Búsqueda por similitud vectorial sobre una segunda base de datos.
+-- Este guion opera sobre una sola tabla, así que el ejemplo vectorial completo
+-- vive en scripts/demo_vectorial.sh, que crea su propia base de datos.
+-- ---------------------------------------------------------------------------

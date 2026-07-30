@@ -656,19 +656,19 @@ void RunKnnBenchmark(Database& db, std::size_t k, std::size_t query_count) {
               << "   k = " << k << "   " << query_count << " consultas\n\n";
 
     const std::string separator =
-        "+-----------------------------+-----------+-----------+-----------+-----------+-----------+";
+        "+-----------------------------+-------------+-----------+-----------+-----------+--------+";
     std::cout << separator << '\n'
-              << "| estrategia                  | media     | p50       | p95       | p99       "
-                 "| cons/s    |\n"
+              << "| estrategia                  | media       | p50       | p95       | p99       "
+                 "| cons/s |\n"
               << separator << '\n';
 
     const auto row = [](const char* label, const KnnStatistics& stats) {
         std::cout << "| " << Pad(label, 27) << " | "
-                  << Pad(std::format("{:.4f} ms", stats.mean), 9) << " | "
+                  << Pad(std::format("{:.4f} ms", stats.mean), 11) << " | "
                   << Pad(std::format("{:.4f}", stats.p50), 9) << " | "
                   << Pad(std::format("{:.4f}", stats.p95), 9) << " | "
                   << Pad(std::format("{:.4f}", stats.p99), 9) << " | "
-                  << Pad(std::format("{:.0f}", stats.queries_per_second), 9) << " |\n";
+                  << Pad(std::format("{:.0f}", stats.queries_per_second), 6) << " |\n";
     };
     row("Top-k acotado (O(n log k))", topk);
     row("Orden completo (O(n log n))", full);

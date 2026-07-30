@@ -119,7 +119,15 @@ void AggregateOperator::Open() {
     }
     child_->Close();
 
-    groups_.assign(counts.begin(), counts.end());
+    // Extracted rather than copied. A map key is const, but a node handle's key()
+    // is not, so extract is the sanctioned way to move a key out of a map. It
+    // matters because a key is a Value, which may hold a vector: copying every one
+    // of them would not be free. Taking begin() each time keeps ascending order.
+    groups_.reserve(counts.size());
+    while (!counts.empty()) {
+        auto node = counts.extract(counts.begin());
+        groups_.emplace_back(std::move(node.key()), node.mapped());
+    }
 }
 
 std::optional<Record> AggregateOperator::Next() {

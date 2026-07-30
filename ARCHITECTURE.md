@@ -22,6 +22,7 @@ graph TD
         FILT["FilterOperator"]
         SEQ["SequentialScanOperator"]
         IDX["IndexScanOperator"]
+        KNN["KnnScanOperator<br/>bloqueante · exacto"]
     end
 
     CAT["Catalog + Schema"]
@@ -40,8 +41,11 @@ graph TD
     DB --> EE
     EE --> PROJ
     PROJ --> SORT
+    PROJ --> KNN
     PROJ --> FILT
     PROJ --> IDX
+    KNN --> FILT
+    KNN --> SEQ
     SORT --> AGG
     SORT --> FILT
     AGG --> FILT
@@ -77,6 +81,8 @@ graph TD
 | `SequentialScan`, `IndexScan`, `Filter`, `Projection` | Operadores en flujo | `execution/operators.cpp` |
 | `SortOperator`, `AggregateOperator` | Operadores bloqueantes (`ORDER BY`, `GROUP BY`) | `execution/blocking_operators.cpp` |
 | `RecordBatch` | Lote de registros y su vector de selección | `execution/record_batch.*` |
+| `vector_metrics` | Distancias y similitudes entre vectores | `vector/distance.*` |
+| `KnnScanOperator`, `KnnFullSortOperator` | Ranking exacto de vecinos más cercanos | `execution/knn_operators.cpp` |
 | `BatchOperator`, `VectorizedScanOperator`, `VectorizedFilterOperator` | Camino de ejecución por lotes | `execution/vectorized_operators.cpp` |
 | `ExecutionEngine` | Elegir el plan y aplicar las modificaciones | `execution/execution_engine.*` |
 | `Database` | Ensamblar todo, ejecutar sentencias, sincronizar al cerrar | `database/database.*` |
@@ -495,6 +501,79 @@ construye un `std::string`, y eso lo paga igual el camino por lotes. Es la razó
 que la mejora en tiempo sea de 1.5x-2.2x y no de un orden de magnitud, y quitarlo
 exigiría almacenamiento columnar, es decir otro formato de archivo.
 
+### SELECT con NEAREST — vecinos más cercanos
+
+`Projection( Knn( Filter?( Scan ) ) )`. El ranking es un operador bloqueante: el
+registro más cercano no puede conocerse antes de haber examinado el último, así que
+`Open` vacía al hijo.
+
+**La búsqueda es exhaustiva.** No hay índice vectorial: un índice hash dispersa las
+claves precisamente para destruir la vecindad, así que no puede responder una consulta
+de proximidad. Las dos estrategias implementadas examinan todos los registros y
+difieren solo en cuánto ordenan después:
+
+| | `KnnScanOperator` | `KnnFullSortOperator` |
+|---|---|---|
+| Ranking | Montículo de máximos acotado a `k` | Ordena las `n` puntuaciones |
+| Tiempo | `Θ(n·d) + O(n log k)` | `Θ(n·d) + O(n log n)` |
+| Espacio | `O(k)` candidatos | `O(n)` candidatos |
+| Exactitud | Exacta | Exacta |
+
+Ambas comparten la función que calcula la puntuación, lo que garantiza que la
+aritmética sea literalmente el mismo código y que la diferencia medida proceda solo del
+ranking. El interruptor está en `ExecutionEngine::SetTopKEnabled` y existe para poder
+medir una contra la otra, igual que los de índice y de lotes.
+
+**La puntuación de ranking** es una cantidad en la que *menor es siempre más cercano*,
+cualquiera que sea la métrica: la distancia euclidiana **al cuadrado**, la distancia
+coseno, y el producto punto **negado**. Eso permite una sola comparación para las tres.
+La raíz cuadrada se aplica solo a las `k` filas devueltas: es monótona, así que no
+altera el orden, y omitirla ahorra `n − k` llamadas a `sqrt` por consulta.
+
+**Empates.** Se resuelven por clave primaria. Sin esa regla el resultado dependería del
+orden en que el montículo hubiera desalojado candidatos, que depende de la disposición
+física de las páginas: la consulta dejaría de ser reproducible.
+
+**Búsqueda híbrida.** Como el ranking se sitúa encima del filtro, un `WHERE` reduce los
+candidatos antes de que se calcule una sola distancia. No hizo falta código para eso: es
+composición de operadores.
+
+**Independencia del método de acceso.** El ranking consume de cualquier operador de
+escaneo, de modo que el escaneo tupla a tupla y el escaneo por lotes lo alimentan
+indistintamente sin que el resultado cambie.
+
+### El tipo VECTOR(d) en el formato binario
+
+| Offset | Tamaño | Campo |
+|---|---|---|
+| 0 | 2 | dimensión (`uint16`) |
+| 2 | 4·d | componentes IEEE 754 binary32, *little-endian* |
+
+Total `2 + 4d` bytes, dentro del registro ranurado, como cualquier otra columna. Los
+bits del `float` se obtienen con `std::bit_cast` y no reinterpretando un puntero, de
+modo que el formato queda definido por el estándar.
+
+La dimensión se escribe aunque el esquema ya la fije: un registro puede leerse sin
+consultar el catálogo, y una longitud corrupta se detecta al deserializar en lugar de
+producir un vector desplazado en silencio.
+
+**Cota y capacidad.** `kMaxVectorDimension = 1000`, es decir 4002 bytes, cabe en una
+página vacía por sí solo. Pero esa cota no basta: dos columnas `VECTOR(1000)` sumarían
+8004 bytes. Por eso el constructor de `Schema` comprueba además que
+`MaxSerializedSize() ≤ kMaxRecordSize`, lo que **restaura** el invariante que `INT` y
+`VARCHAR` cumplían por construcción: ningún registro válido puede fallar al caber en una
+página vacía.
+
+| Dimensión | Bytes por vector | Registros por página de 4096 B |
+|---:|---:|---:|
+| 16 | 66 | 58 |
+| 64 | 258 | 15 |
+| 256 | 1026 | 3 |
+| 768 | 3074 | 1 |
+
+La última fila explica por qué la evaluación se acota a dimensión 256: con 768 cabría un
+registro por página y el escaneo degeneraría en una lectura de página por registro.
+
 ### Coste de cada sentencia
 
 Cada operador cuenta cuántas veces se tiró de él y cuántas filas entregó. Lo hace
@@ -587,4 +666,7 @@ inesperado).
 | Interruptor para desactivar el índice | Comparar el rendimiento con y sin índice exige que todo lo demás sea idéntico. Un `bool` en el planificador es la forma más pequeña de conseguirlo; no es un modo de operación |
 | La ejecución vectorizada está desactivada por defecto | Los operadores tupla a tupla son la implementación de referencia del modelo Volcano sobre el que está construido el sistema. Tener los dos caminos vivos y probados es además lo que permite medir uno contra el otro en lugar de argumentarlo |
 | No hay almacenamiento columnar | Es lo que haría que la vectorización rindiera de verdad, porque eliminaría la deserialización por registro. Pero cambiaría el formato del archivo, las páginas ranuradas y el índice: sería otro proyecto, no una mejora de este |
+| La búsqueda por similitud es exhaustiva | Un índice IVF o HNSW cambiaría el orden de complejidad, no un factor constante, pero exige una estructura persistente propia. Se propone como trabajo futuro y el sistema **no** llama «índice» a lo que tiene |
+| Un vector no admite `ORDER BY` ni `GROUP BY` | Un vector no tiene un orden total natural único. Se rechaza al construir el plan y no en el comparador, porque en el comparador el error dependería del número de filas |
+| El `float` escalar de `Value` no se persiste | Existe solo para que la distancia calculada viaje por el plan. `Record::Validate` lo rechaza, que es lo que lo mantiene fuera del archivo |
 | Un lote puede pasarse de `kTargetSize` | Cortar en el límite exacto obligaría al escaneo a recordar una posición dentro de una página. Permitir el exceso deja su estado en un solo `PageId` |

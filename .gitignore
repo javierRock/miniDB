@@ -17,3 +17,8 @@ compile_commands.json
 
 # Packaged deliverable
 minidb-src.zip
+
+# Datos y bases de datos generados por los experimentos. Los CSV y las figuras de
+# experimentos/resultados y experimentos/graficos SÍ se versionan: son la evidencia
+# del artículo.
+experimentos/datos/datos_generados/

@@ -25,6 +25,7 @@ solo para las pruebas.
 - [Buffer Pool](#buffer-pool)
 - [Índice hash](#índice-hash)
 - [Modelo Volcano](#modelo-volcano)
+- [Búsqueda por similitud vectorial](#búsqueda-por-similitud-vectorial)
 - [Ejecución vectorizada](#ejecución-vectorizada)
 - [Evaluación de rendimiento](#evaluación-de-rendimiento)
 - [Archivos en disco](#archivos-en-disco)
@@ -50,6 +51,9 @@ El detalle técnico completo —offsets, invariantes y diagramas— está en
 - **Procesamiento de consultas**: tokenizador y parser descendente recursivo
   propios, y seis operadores físicos componibles, incluidos `ORDER BY` y
   `GROUP BY` como operadores bloqueantes.
+- **Búsqueda por similitud vectorial**: un tipo `VECTOR(d)` persistido en las mismas
+  páginas ranuradas que los demás registros, tres métricas de distancia y una consulta
+  de los `k` vecinos más cercanos con selección Top-k acotada.
 - **Ejecución vectorizada**: además del camino Volcano tupla a tupla, un camino
   por lotes en el que `NextBatch` mueve ~1024 registros de una vez, el escaneo
   fija cada página una sola vez y el filtro compara sobre una columna contigua
@@ -158,7 +162,10 @@ bash scripts/inspect_database.sh
 | `.flush` | Sincroniza todas las páginas sucias |
 | `.indice [on\|off]` | Activa o desactiva el uso del índice, para medir su efecto |
 | `.vectorizado [on\|off]` | Cambia entre ejecución tupla a tupla y por lotes |
+| `.topk [on\|off]` | Top-k acotado u orden completo en las consultas `NEAREST` |
 | `.bench [n]` | Compara `n` búsquedas por clave con y sin índice |
+| `.knnbench [k] [n]` | Compara las dos estrategias de ranking vectorial |
+| `.knncsv <ruta> [k] [n]` | Igual, exportando una fila CSV por consulta |
 | `.benchvec [n]` | Compara los dos modelos de ejecución sobre la misma consulta |
 | `.exit` | Sincroniza y sale |
 
@@ -174,7 +181,7 @@ bash scripts/benchmark.sh
 ctest --test-dir build --output-on-failure
 ```
 
-Más de 260 casos repartidos en once binarios, uno por componente. Cada prueba
+Más de 310 casos repartidos en trece binarios, uno por componente. Cada prueba
 usa su propio archivo temporal y lo borra al terminar, así que no comparten
 estado y pueden ejecutarse en cualquier orden.
 
@@ -191,15 +198,20 @@ estado y pueden ejecutarse en cualquier orden.
 | `blocking_operators_test` | `ORDER BY` y `GROUP BY`: orden, estabilidad, grupos, fijaciones |
 | `evaluation_test` | Contadores por operador, tiempo, páginas leídas, con y sin índice |
 | `vectorized_test` | Lotes, vector de selección, equivalencia de los dos modelos |
+| `distance_test` | Métricas de distancia contra valores calculados a mano |
+| `knn_test` | Tipo `VECTOR`, gramática `NEAREST`, casos límite y equivalencia del ranking |
 | `integration_test` | Ciclo completo, consistencia tabla-índice, configuración |
 
 ## SQL soportado
 
 ```sql
-CREATE TABLE <tabla> (<col> INT [PRIMARY KEY] | <col> VARCHAR(<n>), ...);
-INSERT INTO <tabla> VALUES (<v1>, <v2>, ...);
+CREATE TABLE <tabla> (<col> INT [PRIMARY KEY] | <col> VARCHAR(<n>)
+                      | <col> VECTOR(<d>), ...);
+INSERT INTO <tabla> VALUES (<v1>, <v2>, ...);   -- un vector: [0.1, 0.9, ...]
 SELECT * | <col> | COUNT(*), ... FROM <tabla> [WHERE <col> <op> <valor>]
     [GROUP BY <col>] [ORDER BY <col> | COUNT(*) [ASC | DESC]];
+SELECT ... FROM <tabla> [WHERE <col> <op> <valor>]
+    NEAREST <col_vector> TO [<v1>, ...] [USING EUCLIDEAN|COSINE|DOT] LIMIT <k>;
 UPDATE <tabla> SET <col> = <valor> [, ...] [WHERE <col> <op> <valor>];
 DELETE FROM <tabla> [WHERE <col> <op> <valor>];
 ```
@@ -380,6 +392,105 @@ esa forma. Sí construyen un plan real para localizar sus filas, en dos fases:
 primero recorren el plan y recogen las posiciones, lo cierran, y solo entonces
 modifican. Reescribir páginas mientras un escaneo sigue recorriéndolas
 invalidaría los offsets de los que depende.
+
+## Búsqueda por similitud vectorial
+
+Un índice hash responde «qué registro tiene exactamente esta clave». Dispersa las
+claves precisamente para destruir la vecindad, de modo que no puede responder «qué
+registros se parecen más a este». Esa segunda pregunta es la que necesitan las
+representaciones vectoriales densas, y es la que el tipo `VECTOR(d)` y la cláusula
+`NEAREST` añaden al sistema.
+
+```
+minidb> CREATE TABLE docs (id INT PRIMARY KEY, titulo VARCHAR(20), emb VECTOR(2));
+minidb> INSERT INTO docs VALUES (1, 'A', [1, 0]);
+minidb> INSERT INTO docs VALUES (2, 'B', [0, 1]);
+minidb> INSERT INTO docs VALUES (3, 'C', [1, 1]);
+
+minidb> SELECT * FROM docs NEAREST emb TO [0.9, 0.1] LIMIT 3;
+Plan físico (modelo Volcano):
+  ProjectionOperator                    filas=3  next=4
+  └─ KnnScanOperator                    filas=3  next=4  distancias=3
+    └─ SequentialScanOperator           filas=3  next=4
++----+--------+--------+-----------+
+| id | titulo | emb    | distancia |
++----+--------+--------+-----------+
+| 1  | A      | [1, 0] | 0.141421  |
+| 3  | C      | [1, 1] | 0.905538  |
+| 2  | B      | [0, 1] | 1.27279   |
++----+--------+--------+-----------+
+```
+
+Las tres distancias son `√0,02`, `√0,82` y `√1,62`: el ejemplo se comprueba a mano.
+
+**Almacenamiento.** Un vector es `2 + 4d` bytes —una dimensión de 16 bits seguida de
+`d` valores IEEE 754 de 32 bits *little-endian*— dentro del mismo registro ranurado que
+las demás columnas, leído por el mismo Buffer Pool. No hay un almacén vectorial
+aparte, y por eso los accesos a vectores aparecen en los mismos contadores de aciertos
+y fallos que todo lo demás.
+
+Con `INT` y `VARCHAR` las cotas del sistema ya demostraban que ningún registro válido
+podía exceder una página. Un vector rompe eso por sí solo, así que el constructor del
+esquema comprueba ahora que el registro **más ancho posible** de la tabla quepa en una
+página vacía. Sin esa comprobación, un `CREATE TABLE` podría aceptarse y luego producir
+filas que no caben en ninguna página.
+
+**Métricas.** Distancia euclidiana, distancia y similitud coseno —que son cantidades
+distintas, y confundirlas invierte el ranking— y producto punto. Internamente todas se
+reducen a una puntuación en la que *menor es siempre más cercano*: la euclidiana **al
+cuadrado**, porque la raíz es monótona y solo hace falta en las `k` filas que se
+devuelven, y el producto punto **negado**, porque es una similitud. Así un único
+operador implementa las tres con una sola comparación.
+
+El coseno del vector nulo no está definido; la implementación lo define como 0 y lo
+documenta, en lugar de devolver un `NaN` que haría que el resultado dependiera del
+orden de visita de los registros.
+
+**Ranking.** `KnnScanOperator` mantiene un montículo de máximos acotado a `k`: un
+candidato solo entra si mejora al peor de los supervivientes. Cuesta `O(n log k)` en
+tiempo y `O(k)` en espacio. La alternativa ingenua, ordenar las `n` distancias, existe
+también como `KnnFullSortOperator` y se activa con `.topk off`; cuesta `O(n log n)` y
+`O(n)`. Las dos son **exactas** y devuelven exactamente las mismas filas, lo que las
+pruebas comprueban fila a fila.
+
+Los empates se resuelven por clave primaria, para que dos registros a la misma
+distancia salgan siempre en el mismo orden.
+
+**Búsqueda híbrida.** Un `WHERE` situado debajo del ranking reduce los candidatos antes
+de que se calcule una sola distancia, por simple composición de operadores:
+
+```
+minidb> SELECT id FROM docs WHERE id <= 50 NEAREST emb TO [...] LIMIT 5;
+  ProjectionOperator → KnnScanOperator → FilterOperator → SequentialScanOperator
+```
+Con 400 registros en la tabla y ese filtro, se calculan exactamente 50 distancias.
+
+### Lo que NO es
+
+**No hay índice vectorial.** La búsqueda es exhaustiva: examina todos los registros, y
+su coste crece linealmente con la colección. La mejora del Top-k acotado es un factor
+constante, no un cambio de orden de complejidad. Un índice IVF o HNSW sería lo que
+cambiaría eso, y se propone como trabajo futuro.
+
+Por la misma razón no hay búsqueda aproximada y no se reporta `Recall@k`: esa métrica
+cuantifica lo que pierde una búsqueda aproximada, y aquí ambas estrategias son exactas.
+
+### Evaluación
+
+`.knnbench [k] [consultas]` compara las dos estrategias sobre las mismas consultas,
+generadas con semilla fija dentro del binario. Con 100 000 vectores de dimensión 64 y
+`k = 10`, el Top-k acotado promedia 63,0 ms por consulta frente a 101,8 ms del orden
+completo: **1,61x**. La ventaja crece con el número de vectores —1,32x con mil— y decrece
+con la dimensión —1,19x con dimensión 256—, porque el término aritmético `Θ(n·d)`, común
+a las dos, pasa a dominar.
+
+Las lecturas de disco son **idénticas** en ambas: 7139 páginas por consulta con 100 000
+vectores. La mejora es exclusivamente de cómputo y de memoria, y no reduce el tráfico
+con el disco.
+
+El estudio completo, con las tablas, las figuras y el análisis, está en
+[docs/articulo_busqueda_vectorizada.md](docs/articulo_busqueda_vectorizada.md); los
+experimentos se reproducen con [experimentos/](experimentos/README.md).
 
 ## Ejecución vectorizada
 
