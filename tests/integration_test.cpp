@@ -93,6 +93,25 @@ TEST(IntegrationTest, DestructorFlushesWithoutAnExplicitCall) {
     EXPECT_EQ(reopened.Execute("SELECT * FROM students").rows.size(), 1u);
 }
 
+TEST(IntegrationTest, RecoversHeaderOnlyDatabaseAfterInterruptedCreation) {
+    TempDatabase temp("interrupted_creation");
+    {
+        DiskManager disk(temp.Path());
+        disk.Flush();
+    }
+    ASSERT_EQ(temp.SizeOnDisk(), kPageSize);
+
+    {
+        Database db(temp.Path());
+        EXPECT_FALSE(db.HasTable());
+        db.Flush();
+    }
+
+    EXPECT_EQ(temp.SizeOnDisk(), 2u * kPageSize);
+    Database reopened(temp.Path());
+    EXPECT_FALSE(reopened.HasTable());
+}
+
 TEST(IntegrationTest, DuplicatePrimaryKeyLeavesTheTableUnchanged) {
     TempDatabase temp("duplicate");
     Database db(temp.Path());

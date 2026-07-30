@@ -136,6 +136,7 @@ Tras cada sentencia se muestra el plan físico, el tiempo y las páginas leídas
 
 Comandos internos:
   .help     Esta ayuda
+  .clear    Limpia la pantalla
   .schema   Esquema de la tabla
   .pages    Páginas del archivo por tipo
   .buffer   Frames del Buffer Pool y estadísticas
@@ -785,6 +786,9 @@ bool RunInternalCommand(const std::string& full_command, Database& db,
     }
     if (command == ".help") {
         PrintHelp();
+    } else if (command == ".clear") {
+        // ANSI clear-screen and cursor-home; avoids spawning an external shell.
+        std::cout << "\x1B[2J\x1B[H" << std::flush;
     } else if (command == ".schema") {
         PrintSchema(db);
     } else if (command == ".pages") {

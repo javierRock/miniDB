@@ -155,6 +155,7 @@ bash scripts/inspect_database.sh
 | Comando | Qué muestra |
 |---|---|
 | `.help` | SQL admitido, comandos y ejemplos |
+| `.clear` | Limpia la pantalla y devuelve el cursor al inicio |
 | `.schema` | Esquema de la tabla y número de registros |
 | `.pages` | Páginas del archivo, por tipo, y la lista de libres |
 | `.buffer` | Estado de cada frame y estadísticas del Buffer Pool |

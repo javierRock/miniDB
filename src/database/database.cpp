@@ -78,9 +78,11 @@ Database::Database(std::filesystem::path path, std::size_t buffer_pool_frames, b
     disk_ = std::make_unique<DiskManager>(path_);
     pool_ = std::make_unique<BufferPoolManager>(*disk_, buffer_pool_frames);
 
-    // The catalog always occupies page 1, so it is created immediately after
-    // the file header and before anything else can allocate.
-    catalog_ = std::make_unique<Catalog>(*pool_, disk_->WasCreated());
+    // A header-only file can remain if creation was interrupted before the
+    // catalog reached page 1. It contains no user data, so finish initializing
+    // it just like a newly created file.
+    const bool create_catalog = disk_->WasCreated() || disk_->PageCount() == 1;
+    catalog_ = std::make_unique<Catalog>(*pool_, create_catalog);
 
     if (catalog_->HasTable()) {
         OpenExistingTable();
