@@ -25,6 +25,7 @@ solo para las pruebas.
 - [Buffer Pool](#buffer-pool)
 - [Índice hash](#índice-hash)
 - [Modelo Volcano](#modelo-volcano)
+- [Evaluación de rendimiento](#evaluación-de-rendimiento)
 - [Archivos en disco](#archivos-en-disco)
 - [Limitaciones](#limitaciones)
 
@@ -46,7 +47,13 @@ El detalle técnico completo —offsets, invariantes y diagramas— está en
   que se leen y escriben a través del Buffer Pool, con resolución de colisiones
   por encadenamiento y páginas de overflow.
 - **Procesamiento de consultas**: tokenizador y parser descendente recursivo
-  propios, y cuatro operadores físicos componibles.
+  propios, y seis operadores físicos componibles, incluidos `ORDER BY` y
+  `GROUP BY` como operadores bloqueantes.
+- **Medición del coste**: cada sentencia informa de su plan con contadores por
+  operador, del tiempo empleado y de las páginas leídas del disco.
+- **Evaluación con y sin índice**: `.bench` resuelve el mismo lote de búsquedas
+  por los dos caminos de acceso y compara tiempo, páginas y registros
+  examinados.
 
 ## Requisitos
 
@@ -144,7 +151,15 @@ bash scripts/inspect_database.sh
 | `.buffer` | Estado de cada frame y estadísticas del Buffer Pool |
 | `.files` | Rutas y tamaños de los archivos en disco |
 | `.flush` | Sincroniza todas las páginas sucias |
+| `.indice [on\|off]` | Activa o desactiva el uso del índice, para medir su efecto |
+| `.bench [n]` | Compara `n` búsquedas por clave con y sin índice |
 | `.exit` | Sincroniza y sale |
+
+Evaluación de rendimiento con y sin índice, sobre su propia base de datos:
+
+```bash
+bash scripts/benchmark.sh
+```
 
 ## Pruebas
 
@@ -152,7 +167,7 @@ bash scripts/inspect_database.sh
 ctest --test-dir build --output-on-failure
 ```
 
-Cerca de 200 casos repartidos en ocho binarios, uno por componente. Cada prueba
+Más de 230 casos repartidos en diez binarios, uno por componente. Cada prueba
 usa su propio archivo temporal y lo borra al terminar, así que no comparten
 estado y pueden ejecutarse en cualquier orden.
 
@@ -166,6 +181,8 @@ estado y pueden ejecutarse en cualquier orden.
 | `hash_index_test` | Colisiones, overflow, inserción masiva, persistencia |
 | `parser_test` | Gramática, errores con posición, mayúsculas, acentos |
 | `volcano_test` | `Open`/`Next`/`Close`, elección de plan, streaming |
+| `blocking_operators_test` | `ORDER BY` y `GROUP BY`: orden, estabilidad, grupos, fijaciones |
+| `evaluation_test` | Contadores por operador, tiempo, páginas leídas, con y sin índice |
 | `integration_test` | Ciclo completo, consistencia tabla-índice, configuración |
 
 ## SQL soportado
@@ -173,12 +190,22 @@ estado y pueden ejecutarse en cualquier orden.
 ```sql
 CREATE TABLE <tabla> (<col> INT [PRIMARY KEY] | <col> VARCHAR(<n>), ...);
 INSERT INTO <tabla> VALUES (<v1>, <v2>, ...);
-SELECT * | <col>, ... FROM <tabla> [WHERE <col> <op> <valor>];
+SELECT * | <col> | COUNT(*), ... FROM <tabla> [WHERE <col> <op> <valor>]
+    [GROUP BY <col>] [ORDER BY <col> | COUNT(*) [ASC | DESC]];
 UPDATE <tabla> SET <col> = <valor> [, ...] [WHERE <col> <op> <valor>];
 DELETE FROM <tabla> [WHERE <col> <op> <valor>];
 ```
 
 - Operadores de comparación: `=`, `!=` (o `<>`), `<`, `<=`, `>`, `>=`.
+- `ORDER BY` admite una columna, con `ASC` (por defecto) o `DESC`. Se resuelve
+  contra las columnas que produce el operador de debajo, así que puede ordenar
+  por una columna que no se proyecta.
+- `GROUP BY` admite una columna, y `COUNT(*)` es la única función de agregado.
+  `SELECT COUNT(*) FROM t` sin `GROUP BY` cuenta la tabla entera. Con `GROUP BY`
+  hay que indicar las columnas: `SELECT *` se rechaza porque el resultado ya no
+  son las columnas de la tabla.
+- El ordenamiento es estable: las filas que empatan conservan el orden en que
+  las produjo el escaneo, que es el de inserción.
 - Las palabras clave no distinguen mayúsculas de minúsculas; los identificadores
   conservan su forma pero se comparan sin distinguirlas.
 - El `;` final es opcional en modo interactivo y separa sentencias en un guion.
@@ -302,14 +329,37 @@ SELECT * FROM students;              SELECT * FROM students WHERE id = 1;
   SequentialScanOperator               IndexScanOperator
 
 
-SELECT * FROM students WHERE age >= 20;
+SELECT * FROM students WHERE age >= 20;   SELECT * FROM students ORDER BY age DESC;
+
+  ProjectionOperator                        ProjectionOperator
+          |                                         |
+  FilterOperator                            SortOperator
+          |                                         |
+  SequentialScanOperator                    SequentialScanOperator
+
+
+SELECT career, COUNT(*) FROM students GROUP BY career ORDER BY COUNT(*) DESC;
 
   ProjectionOperator
           |
-  FilterOperator
+  SortOperator             <- ordena la salida del agregado
+          |
+  AggregateOperator        <- una fila por grupo
           |
   SequentialScanOperator
 ```
+
+**Operadores en flujo y operadores bloqueantes.** `Filter` y `Projection`
+responden a un `Next` con como mucho una llamada a su hijo, así que un plan hecho
+solo de ellos usa memoria proporcional a un registro. `Sort` y `Aggregate` no
+pueden: ni la primera fila ordenada ni un conteo se conocen antes de haber leído
+el último registro de la entrada, de modo que ambos vacían a su hijo dentro de
+`Open`. Por eso viven en su propio archivo, `src/execution/blocking_operators.cpp`.
+
+`Sort` se coloca **debajo** de la proyección cuando no hay `GROUP BY`, para que
+`ORDER BY` pueda nombrar una columna que no se proyecta, y **encima** del
+agregado cuando lo hay, para poder ordenar por el grupo o por `COUNT(*)`. Es una
+sola regla: *`ORDER BY` se resuelve contra las columnas que produce su hijo*.
 
 El planificador elige `IndexScanOperator` **solo** cuando la condición es una
 igualdad sobre la clave primaria, que es la única pregunta que un índice hash
@@ -323,16 +373,74 @@ primero recorren el plan y recogen las posiciones, lo cierran, y solo entonces
 modifican. Reescribir páginas mientras un escaneo sigue recorriéndolas
 invalidaría los offsets de los que depende.
 
+## Evaluación de rendimiento
+
+Cada sentencia informa de lo que costó:
+
+```
+minidb> SELECT * FROM students WHERE id = 1500;
+Plan físico (modelo Volcano):
+  ProjectionOperator                    filas=1  next=2
+  └─ IndexScanOperator                  filas=1  next=2
+...
+1 fila devuelta.
+Tiempo: 0.038 ms | páginas leídas del disco: 2 | buffer 2/2 (aciertos/fallos)
+```
+
+`filas` es lo que el operador entregó y `next` las veces que se tiró de él; la
+diferencia entre lo que produce un escaneo y lo que deja pasar el filtro es el
+trabajo que el índice evita.
+
+`.bench [n]` resuelve el mismo lote de `n` búsquedas por clave primaria por los
+dos caminos de acceso. Las claves se recogen antes de medir y las consultas son
+idénticas en ambas rondas: lo único que cambia es si el planificador puede usar
+el índice, que se controla con `.indice on|off`. No modifica la tabla.
+
+```
+$ bash scripts/benchmark.sh          # 3000 filas, 100 consultas por ronda
+
+Comparación de rendimiento con y sin índice
+Tabla: students   3000 registros   18 páginas de datos   100 consultas por clave primaria
+
++-----------------------------+-------------+-------------+------------+-------------+
+| plan                        | tiempo      | por consulta| páginas    | registros   |
++-----------------------------+-------------+-------------+------------+-------------+
+| IndexScan (con índice)      | 3.586 ms    | 0.0359 ms   | 119        | 100         |
+| SeqScan+Filter (sin índice) | 1056.872 ms | 10.5687 ms  | 1800       | 300000      |
++-----------------------------+-------------+-------------+------------+-------------+
+
+Registros examinados: 100 con índice frente a 300000 sin él.
+Aceleración en tiempo: 294.8x.
+Páginas leídas del disco: 15.1x menos con índice.
+```
+
+El volumen es configurable: `BENCH_ROWS=10000 BENCH_QUERIES=200 bash
+scripts/benchmark.sh`.
+
+Dos matices que el propio comando señala:
+
+- La ventaja en **registros examinados** es estructural: el índice lee la fila
+  que se le pidió, el escaneo lee todas. No depende de la máquina.
+- La ventaja en **páginas leídas** depende del tamaño relativo del Buffer Pool.
+  El índice tiene sus propias páginas —cabecera y buckets— compitiendo por los
+  frames, así que en una tabla que casi cabe en el pool puede leer *más* páginas
+  que un escaneo. Con tablas mayores que el pool la diferencia se dispara. El
+  comando lo dice en lugar de presentar solo el caso favorable.
+- Los tiempos son de una máquina concreta y de una compilación **Debug**; sirven
+  para comparar las dos filas entre sí, no como cifra absoluta.
+
 ## Archivos en disco
 
 | Archivo | Qué es |
 |---|---|
 | `data/minidb.db` | Base de datos completa: cabecera, catálogo, datos, índice y overflow |
 | `minidb.conf` | Configuración en texto: archivo de datos y número de frames |
+| `data/bench.db` | Solo si se ejecuta `scripts/benchmark.sh`: base independiente para la evaluación |
 
-El sistema no genera archivos temporales, porque no implementa operadores
-bloqueantes (`ORDER BY`, `GROUP BY`, `JOIN`) que necesiten volcar resultados
-intermedios.
+El sistema no genera archivos temporales. `ORDER BY` y `GROUP BY` sí son
+operadores bloqueantes, pero materializan en RAM, acotados por el tamaño de la
+tabla. Una ordenación externa por mezcla, que volcaría los tramos ordenados a
+disco, sería el paso siguiente y no está implementada.
 
 Tras crear la tabla, el archivo ocupa exactamente 20 páginas (81 920 bytes): la
 cabecera, el catálogo, la cabecera del índice, los 16 buckets y la primera

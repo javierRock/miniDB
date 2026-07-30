@@ -55,6 +55,17 @@ public:
 
     [[nodiscard]] QueryResult Execute(const Statement& statement);
 
+    /// Turns the index off, so a query that could use it falls back to a
+    /// sequential scan.
+    ///
+    /// This exists for the evaluation the course asks for: comparing the same
+    /// query with and without an index is only honest if the data, the plan
+    /// above the scan and the buffer pool are otherwise identical, and a switch
+    /// here is the smallest change that achieves that. It is not a mode the
+    /// system is meant to run in.
+    void SetIndexEnabled(bool enabled) { index_enabled_ = enabled; }
+    [[nodiscard]] bool IndexEnabled() const { return index_enabled_; }
+
     /// Builds the physical plan for a SELECT without running it. Exposed so the
     /// tests can assert which plan was chosen.
     [[nodiscard]] std::unique_ptr<PhysicalOperator> BuildPlan(const SelectStatement& select) const;
@@ -90,6 +101,8 @@ private:
     Catalog& catalog_;
     TableHeap& heap_;
     HashIndex& index_;
+    /// Only ever false while measuring; see SetIndexEnabled.
+    bool index_enabled_ = true;
 };
 
 }  // namespace minidb

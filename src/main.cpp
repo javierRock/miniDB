@@ -1,11 +1,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "minidb/database/database.hpp"
@@ -122,6 +125,8 @@ Comandos internos:
   .buffer   Frames del Buffer Pool y estadísticas
   .files    Archivos en disco y su tamaño
   .flush    Sincroniza todas las páginas sucias
+  .indice [on|off]  Activa o desactiva el uso del índice (para medir)
+  .bench [n]        Compara n búsquedas por clave con y sin índice
   .exit     Sincroniza y sale
 
 Ejemplos:
@@ -211,13 +216,155 @@ void PrintFiles(Database& db, const std::filesystem::path& config_path) {
               << (error ? std::string("no existe (se usan los valores por defecto)")
                         : std::to_string(config_size) + " bytes")
               << '\n';
-    std::cout << "El sistema no genera archivos temporales: no hay operadores bloqueantes\n"
-                 "(ORDER BY, GROUP BY o JOIN) que necesiten volcar resultados intermedios.\n";
+    std::cout << "El sistema no genera archivos temporales. ORDER BY y GROUP BY son\n"
+                 "operadores bloqueantes, pero materializan en RAM (acotados por el tamaño\n"
+                 "de la tabla); una ordenación externa por mezcla, que sí necesitaría\n"
+                 "archivos temporales, sería el paso siguiente y no está implementada.\n";
+}
+
+/// Compares the same lookups answered with and without the index.
+///
+/// The keys are collected first, outside the measurement, and the queries are
+/// identical in both rounds: the only difference is whether the planner is
+/// allowed to reach for the index. It reads and never modifies the table, so it
+/// is safe to run at any point in a demo.
+void RunBenchmark(Database& db, std::size_t queries) {
+    if (!db.HasTable()) {
+        std::cout << "No hay ninguna tabla que medir. Use CREATE TABLE e inserte filas.\n";
+        return;
+    }
+
+    const Catalog& catalog = db.GetCatalog();
+    const std::string key_column = catalog.GetSchema().GetColumn(catalog.GetSchema().PrimaryKeyIndex()).name;
+
+    // One scan up front to learn which keys exist. Not measured.
+    std::vector<std::int32_t> keys;
+    for (const Record& row : db.Execute("SELECT " + key_column + " FROM " + catalog.TableName()).rows) {
+        keys.push_back(std::get<std::int32_t>(row.GetValue(0)));
+    }
+    if (keys.empty()) {
+        std::cout << "La tabla está vacía; no hay nada que medir.\n";
+        return;
+    }
+
+    struct Round {
+        const char* label;
+        bool use_index;
+        double elapsed_ms = 0.0;
+        std::uint64_t pages_read = 0;
+        std::uint64_t rows_examined = 0;
+    };
+    Round rounds[] = {{"IndexScan (con índice)", true}, {"SeqScan+Filter (sin índice)", false}};
+
+    const bool restore = db.IndexEnabled();
+    for (Round& round : rounds) {
+        db.SetIndexEnabled(round.use_index);
+        for (std::size_t i = 0; i < queries; ++i) {
+            // Spread the lookups over the whole key range so neither round is
+            // favoured by hitting the same page every time.
+            const std::int32_t key = keys[(i * keys.size() / queries) % keys.size()];
+            const QueryResult result =
+                db.Execute("SELECT * FROM " + catalog.TableName() + " WHERE " + key_column + " = " +
+                           std::to_string(key));
+            round.elapsed_ms += result.elapsed_ms;
+            round.pages_read += result.pages_read;
+            for (const OperatorMetrics& op : result.metrics) {
+                if (op.name == "SequentialScanOperator" || op.name == "IndexScanOperator") {
+                    round.rows_examined += op.rows_produced;
+                }
+            }
+        }
+    }
+    db.SetIndexEnabled(restore);
+
+    std::cout << "Comparación de rendimiento con y sin índice\n"
+              << "Tabla: " << catalog.TableName() << "   " << keys.size() << " registros   "
+              << db.TablePageCount() << " páginas de datos   " << queries
+              << " consultas por clave primaria\n\n";
+
+    const std::string separator =
+        "+-----------------------------+-------------+-------------+------------+-------------+";
+    std::cout << separator << '\n'
+              << "| plan                        | tiempo      | por consulta| páginas    "
+                 "| registros   |\n"
+              << separator << '\n';
+    for (const Round& round : rounds) {
+        std::cout << "| " << Pad(round.label, 27) << " | "
+                  << Pad(std::format("{:.3f} ms", round.elapsed_ms), 11) << " | "
+                  << Pad(std::format("{:.4f} ms", round.elapsed_ms / static_cast<double>(queries)),
+                         11)
+                  << " | " << Pad(std::to_string(round.pages_read), 10) << " | "
+                  << Pad(std::to_string(round.rows_examined), 11) << " |\n";
+    }
+    std::cout << separator << '\n';
+
+    const Round& with = rounds[0];
+    const Round& without = rounds[1];
+    std::cout << "\nRegistros examinados: " << with.rows_examined << " con índice frente a "
+              << without.rows_examined << " sin él.\n";
+    if (with.elapsed_ms > 0.0) {
+        std::cout << std::format("Aceleración en tiempo: {:.1f}x.\n",
+                                 without.elapsed_ms / with.elapsed_ms);
+    }
+
+    // Las lecturas de disco no siempre favorecen al índice, y merece la pena
+    // decirlo: el índice tiene sus propias páginas (cabecera y buckets), así que
+    // en una tabla que cabe casi entera en el pool puede costar más lecturas que
+    // recorrerla. La ventaja en registros examinados, en cambio, es estructural.
+    if (without.pages_read > with.pages_read && with.pages_read > 0) {
+        std::cout << std::format("Páginas leídas del disco: {:.1f}x menos con índice.\n",
+                                 static_cast<double>(without.pages_read) /
+                                     static_cast<double>(with.pages_read));
+    } else if (without.pages_read > with.pages_read) {
+        std::cout << "Con índice no hizo falta ninguna lectura de disco; sin él, "
+                  << without.pages_read << ".\n";
+    } else {
+        std::cout << "Páginas leídas del disco: " << with.pages_read << " con índice frente a "
+                  << without.pages_read << " sin él.\n"
+                  << "El índice no reduce las lecturas en esta tabla: sus propias páginas\n"
+                     "(cabecera y buckets) compiten por el Buffer Pool con las de datos.\n"
+                     "La ventaja se ve con tablas mayores que el pool; pruebe con más filas.\n";
+    }
+}
+
+/// Splits a dot command into its name and its argument, if any.
+[[nodiscard]] std::pair<std::string, std::string> SplitCommand(const std::string& command) {
+    const auto space = command.find(' ');
+    if (space == std::string::npos) {
+        return {command, ""};
+    }
+    const auto argument_start = command.find_first_not_of(' ', space);
+    return {command.substr(0, space),
+            argument_start == std::string::npos ? "" : command.substr(argument_start)};
+}
+
+void RunIndexCommand(Database& db, const std::string& argument) {
+    if (!db.HasTable()) {
+        std::cout << "No hay ninguna tabla definida.\n";
+        return;
+    }
+
+    if (argument == "on") {
+        db.SetIndexEnabled(true);
+    } else if (argument == "off") {
+        db.SetIndexEnabled(false);
+    } else if (!argument.empty()) {
+        std::cout << "Uso: .indice [on|off]\n";
+        return;
+    }
+
+    std::cout << "Uso del índice: " << (db.IndexEnabled() ? "activado" : "DESACTIVADO") << '\n';
+    if (!db.IndexEnabled()) {
+        std::cout << "Las búsquedas por clave primaria usarán un escaneo secuencial.\n"
+                     "Sirve para medir el coste de no tener índice; use .indice on al terminar.\n";
+    }
 }
 
 /// Runs a dot command. Returns false when the session should end.
-bool RunInternalCommand(const std::string& command, Database& db,
+bool RunInternalCommand(const std::string& full_command, Database& db,
                         const std::filesystem::path& config_path) {
+    const auto [command, argument] = SplitCommand(full_command);
+
     if (command == ".exit" || command == ".quit") {
         return false;
     }
@@ -234,6 +381,19 @@ bool RunInternalCommand(const std::string& command, Database& db,
     } else if (command == ".flush") {
         db.Flush();
         std::cout << "Páginas sincronizadas con el disco.\n";
+    } else if (command == ".indice") {
+        RunIndexCommand(db, argument);
+    } else if (command == ".bench") {
+        std::size_t queries = 100;
+        if (!argument.empty()) {
+            const auto* first = argument.data();
+            const auto* last = first + argument.size();
+            if (std::from_chars(first, last, queries).ec != std::errc{} || queries == 0) {
+                std::cout << "Uso: .bench [número de consultas]\n";
+                return true;
+            }
+        }
+        RunBenchmark(db, queries);
     } else {
         std::cout << "Comando desconocido: " << command << ". Use .help\n";
     }

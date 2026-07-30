@@ -165,6 +165,18 @@ void Database::Flush() {
     }
 }
 
+void Database::SetIndexEnabled(bool enabled) {
+    if (engine_ == nullptr) {
+        throw QueryError("No existe ninguna tabla; use CREATE TABLE primero");
+    }
+    engine_->SetIndexEnabled(enabled);
+}
+
+bool Database::IndexEnabled() const {
+    // With no table there is no index either, so nothing can be using one.
+    return engine_ != nullptr && engine_->IndexEnabled();
+}
+
 std::uint32_t Database::TablePageCount() const {
     return heap_ == nullptr ? 0 : heap_->PageCountInChain();
 }

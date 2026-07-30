@@ -64,6 +64,12 @@ public:
     [[nodiscard]] std::uint32_t TablePageCount() const;
     [[nodiscard]] std::uint32_t IndexPageCount() const;
 
+    /// Whether queries are allowed to use the index. See
+    /// ExecutionEngine::SetIndexEnabled: this is here for the with/without
+    /// comparison, not as a normal operating mode.
+    void SetIndexEnabled(bool enabled);
+    [[nodiscard]] bool IndexEnabled() const;
+
 private:
     /// The statement itself, without the measuring. Execute wraps it.
     [[nodiscard]] QueryResult ExecuteParsed(const std::string& sql);

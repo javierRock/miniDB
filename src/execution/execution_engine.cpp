@@ -23,6 +23,10 @@ std::string RowsMessage(std::uint64_t count, const std::string& participle) {
 }  // namespace
 
 bool ExecutionEngine::CanUseIndex(const std::optional<Condition>& where) const {
+    // Switched off only while measuring the cost of not having an index.
+    if (!index_enabled_) {
+        return false;
+    }
     if (!where.has_value() || where->op != CompareOperator::kEqual) {
         return false;
     }

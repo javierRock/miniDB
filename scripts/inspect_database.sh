@@ -71,7 +71,17 @@ echo
 echo "=============================================================="
 echo " Archivos temporales"
 echo "=============================================================="
-echo "El sistema no genera archivos temporales: no implementa operadores"
-echo "bloqueantes (ORDER BY, GROUP BY, JOIN) que necesiten volcar resultados"
-echo "intermedios a disco. Los únicos archivos son el binario de datos y este"
-echo "archivo de configuración."
+echo "El sistema no genera archivos temporales. ORDER BY y GROUP BY sí son"
+echo "operadores bloqueantes (materializan su entrada antes de emitir la primera"
+echo "fila), pero lo hacen en RAM, acotados por el tamaño de la tabla. Una"
+echo "ordenación externa por mezcla, que volcaría los tramos ordenados a disco,"
+echo "sería el paso siguiente y no está implementada."
+echo
+echo "Los archivos del sistema son, por tanto, el binario de datos y el archivo"
+echo "de configuración. El script scripts/benchmark.sh crea además data/bench.db,"
+echo "una segunda base de datos independiente para la evaluación de rendimiento."
+if [ -f data/bench.db ]; then
+    echo
+    echo "Base de datos de evaluación presente:"
+    ls -lh data/bench.db
+fi

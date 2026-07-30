@@ -17,6 +17,8 @@ graph TD
 
     subgraph OPS["Operadores físicos — Open / Next / Close"]
         PROJ["ProjectionOperator"]
+        SORT["SortOperator<br/>bloqueante"]
+        AGG["AggregateOperator<br/>bloqueante"]
         FILT["FilterOperator"]
         SEQ["SequentialScanOperator"]
         IDX["IndexScanOperator"]
@@ -37,8 +39,13 @@ graph TD
     PS --> EE
     DB --> EE
     EE --> PROJ
+    PROJ --> SORT
     PROJ --> FILT
     PROJ --> IDX
+    SORT --> AGG
+    SORT --> FILT
+    AGG --> FILT
+    AGG --> SEQ
     FILT --> SEQ
     EE --> CAT
     EE --> TH
@@ -66,7 +73,9 @@ graph TD
 | `HashIndex` | `int32 → RecordId` en páginas físicas, buckets y overflow | `index/hash_index.*` |
 | `Catalog`, `Schema` | Esquema y punteros raíz, persistidos en la página 1 | `catalog/*` |
 | `Tokenizer`, `Parser` | Texto SQL → `Statement` | `parser/*` |
-| `PhysicalOperator` y derivados | Modelo Volcano | `execution/*` |
+| `PhysicalOperator` y derivados | Modelo Volcano, y los contadores de cada operador | `execution/*` |
+| `SequentialScan`, `IndexScan`, `Filter`, `Projection` | Operadores en flujo | `execution/operators.cpp` |
+| `SortOperator`, `AggregateOperator` | Operadores bloqueantes (`ORDER BY`, `GROUP BY`) | `execution/blocking_operators.cpp` |
 | `ExecutionEngine` | Elegir el plan y aplicar las modificaciones | `execution/execution_engine.*` |
 | `Database` | Ensamblar todo, ejecutar sentencias, sincronizar al cerrar | `database/database.*` |
 
@@ -377,6 +386,75 @@ operador entrega como mucho una fila y no necesita filtro encima.
 `Projection(Filter(SequentialScan))`. El filtro tira de su hijo en bucle hasta
 encontrar una coincidencia, así que tampoco materializa nada.
 
+### SELECT con ORDER BY
+
+`Projection(Sort(...))`. `Sort` es el primer operador **bloqueante** del sistema:
+no puede entregar la primera fila hasta haber visto la última de su entrada, así
+que `Open` vacía al hijo en un `std::vector<Record>`, lo ordena con
+`std::stable_sort` y lo cierra; después `Next` recorre el vector.
+
+Que la ordenación sea estable no es casual: las filas que empatan conservan el
+orden en que las produjo el hijo —para un escaneo de la tabla, el de inserción—,
+lo que hace el resultado reproducible y comprobable.
+
+`Sort` se coloca **debajo** de la proyección, de modo que `ORDER BY` puede
+nombrar una columna que no se proyecta.
+
+### SELECT con GROUP BY
+
+`Projection(Aggregate(...))`, y `Projection(Sort(Aggregate(...)))` si además hay
+`ORDER BY`. `Aggregate` también es bloqueante: un conteo solo se conoce tras el
+último registro. Acumula en un `std::map<Value, uint64_t, ValueLess>`, lo que
+además hace que los grupos salgan ordenados por su valor sin necesidad de un
+`ORDER BY`.
+
+Sin columna de agrupación produce exactamente una fila con el total, incluso
+sobre una tabla vacía: `SELECT COUNT(*) FROM t` devuelve `0`, no «ninguna fila».
+
+La columna de `ORDER BY` se resuelve siempre contra `OutputColumnNames()` del
+hijo. Es una sola regla que cubre los dos casos: bajo la proyección el hijo son
+las columnas de la tabla, y sobre el agregado son el grupo y `COUNT(*)`.
+
+`COUNT(*)` viaja por el sistema como el pseudonombre de columna `"COUNT(*)"`. Un
+identificador SQL no puede contener paréntesis, así que no puede chocar con una
+columna real y no hace falta ningún caso especial por debajo del parser.
+
+**Memoria.** Los dos materializan en RAM, acotados por el tamaño de la tabla. Una
+ordenación externa por mezcla, que volcaría los tramos ordenados a archivos
+temporales, sería el paso siguiente; no está implementada, y es la razón por la
+que el sistema sigue sin generar archivos temporales.
+
+### Coste de cada sentencia
+
+Cada operador cuenta cuántas veces se tiró de él y cuántas filas entregó. Lo hace
+devolviendo su registro a través de `Counted()`, un método protegido de la clase
+base, en lugar de incrementar dos contadores a mano: así un operador añadido más
+tarde no puede quedar fuera de la medición.
+
+El tiempo y las páginas leídas se miden en `Database::Execute`, tomando una foto
+de `BufferPoolStatistics` y del `steady_clock` antes y después. Está ahí y no en
+el motor por dos razones: el tiempo medido incluye el parseo, que es lo que el
+usuario esperó, y el motor sigue sin conocer relojes.
+
+De las dos medidas, la de **páginas leídas** es la que se puede afirmar en una
+prueba: la misma consulta sobre los mismos datos lee siempre las mismas páginas,
+mientras que el reloj depende de la carga de la máquina.
+
+### Evaluación con y sin índice
+
+`ExecutionEngine::SetIndexEnabled(false)` hace que `CanUseIndex` devuelva `false`
+de entrada, con lo que `WHERE <pk> = <valor>` se resuelve con
+`SeqScan+Filter` en lugar de con `IndexScan`. Es la comparación más honesta
+posible: los datos, el resto del plan y el Buffer Pool son idénticos, y lo único
+que cambia es el camino de acceso.
+
+Lo usa el comando `.bench [n]`, que recoge las claves existentes antes de medir
+—fuera de la medición— y ejecuta el mismo lote por los dos caminos. La ventaja en
+registros examinados es estructural; la ventaja en páginas leídas depende de que
+la tabla supere el tamaño del pool, porque las páginas del propio índice compiten
+por los frames. El comando informa de ambos casos en lugar de presentar solo el
+favorable.
+
 ### UPDATE
 
 **Fase 1.** Se construye el mismo árbol que usaría un `SELECT` con ese `WHERE`,
@@ -433,3 +511,6 @@ inesperado).
 | Sin operadores de inserción, actualización y borrado | El modelo Volcano describe iteradores que producen tuplas; una sentencia cuya única salida es un contador no encaja. Siguen usando el pipeline para localizar sus filas |
 | Número de buckets fijo | El hash extensible cambiaría el índice entero para absorber un crecimiento que las páginas de overflow ya manejan |
 | No se puede actualizar la clave primaria | Obligaría a reescribir la entrada del índice bajo otra clave, con un caso intermedio en el que la fila no es localizable |
+| `ORDER BY` y `GROUP BY` materializan en RAM | Una ordenación externa por mezcla es el paso siguiente, no un requisito: con una tabla acotada por el disco de un trabajo académico el vector siempre cabe, y el algoritmo externo triplicaría el código del operador |
+| Solo `COUNT(*)` como agregado | `MIN`, `MAX` y `SUM` reutilizarían la misma estructura sin añadir ningún concepto nuevo al bucle de agregación |
+| Interruptor para desactivar el índice | Comparar el rendimiento con y sin índice exige que todo lo demás sea idéntico. Un `bool` en el planificador es la forma más pequeña de conseguirlo; no es un modo de operación |
