@@ -40,6 +40,12 @@ Schema::Schema(std::vector<Column> columns) : columns_(std::move(columns)) {
                              column.name + "': la longitud debe estar entre 1 y " +
                              std::to_string(kMaxVarcharLength));
         }
+        if (column.type == ColumnType::kVector &&
+            (column.max_length == 0 || column.max_length > kMaxVectorDimension)) {
+            throw QueryError("VECTOR(" + std::to_string(column.max_length) + ") en la columna '" +
+                             column.name + "': la dimensión debe estar entre 1 y " +
+                             std::to_string(kMaxVectorDimension));
+        }
         for (std::size_t j = 0; j < i; ++j) {
             if (EqualsIgnoreCase(columns_[j].name, column.name)) {
                 throw QueryError("Columna duplicada: '" + column.name + "'");
@@ -58,6 +64,20 @@ Schema::Schema(std::vector<Column> columns) : columns_(std::move(columns)) {
     // an INT. Supporting string keys would mean a second index implementation.
     if (columns_[primary_key_index_].type != ColumnType::kInteger) {
         throw QueryError("La PRIMARY KEY debe ser de tipo INT");
+    }
+
+    // With INT and VARCHAR alone the bounds in constants.hpp already guaranteed
+    // that no valid record could exceed a page. A VECTOR column is large enough to
+    // break that by itself, so the guarantee is restored here by checking the
+    // widest possible record against the page's capacity. Without this an INSERT
+    // could be accepted by the schema and then fail to fit in any page, which is a
+    // much worse place to find out.
+    const std::size_t widest_record = MaxSerializedSize();
+    if (widest_record > kMaxRecordSize) {
+        throw QueryError("El registro más ancho posible de esta tabla ocuparía " +
+                         std::to_string(widest_record) + " bytes y una página admite como máximo " +
+                         std::to_string(kMaxRecordSize) + "; reduzca la dimensión del VECTOR o el "
+                         "número de columnas");
     }
 }
 
@@ -80,9 +100,17 @@ std::optional<std::size_t> Schema::FindColumn(const std::string& name) const {
 std::size_t Schema::MaxSerializedSize() const {
     std::size_t total = 0;
     for (const Column& column : columns_) {
-        total += (column.type == ColumnType::kInteger)
-                     ? sizeof(std::int32_t)
-                     : sizeof(std::uint16_t) + column.max_length;
+        switch (column.type) {
+            case ColumnType::kInteger:
+                total += sizeof(std::int32_t);
+                break;
+            case ColumnType::kVector:
+                total += serialization::VectorSize(column.max_length);
+                break;
+            case ColumnType::kVarchar:
+                total += sizeof(std::uint16_t) + column.max_length;
+                break;
+        }
     }
     return total;
 }

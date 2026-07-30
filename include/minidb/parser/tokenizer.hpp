@@ -10,6 +10,10 @@ enum class TokenType {
     // Literals and names
     kIdentifier,
     kIntegerLiteral,
+    /// A number with a decimal point or an exponent. Kept apart from an integer
+    /// literal so that `VECTOR(3)` cannot be written `VECTOR(3.0)` and a vector
+    /// component is never silently truncated to an int.
+    kFloatLiteral,
     kStringLiteral,
 
     // Keywords
@@ -34,6 +38,11 @@ enum class TokenType {
     kAsc,
     kDesc,
     kCount,
+    kVector,
+    kNearest,
+    kTo,
+    kUsing,
+    kLimit,
 
     // Comparison operators
     kEqual,
@@ -49,6 +58,8 @@ enum class TokenType {
     kComma,
     kAsterisk,
     kSemicolon,
+    kLeftBracket,
+    kRightBracket,
 
     kEndOfInput,
 };

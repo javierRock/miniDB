@@ -1,5 +1,6 @@
 #include "minidb/common/serialization.hpp"
 
+#include <bit>
 #include <cstring>
 
 #include "minidb/common/types.hpp"
@@ -62,6 +63,12 @@ void WriteI32(std::span<std::byte> buffer, std::size_t offset, std::int32_t valu
     WriteLittleEndian(buffer, offset, static_cast<std::uint32_t>(value), sizeof(value));
 }
 
+void WriteF32(std::span<std::byte> buffer, std::size_t offset, float value) {
+    static_assert(sizeof(float) == sizeof(std::uint32_t),
+                  "el formato del archivo asume IEEE 754 binary32");
+    WriteLittleEndian(buffer, offset, std::bit_cast<std::uint32_t>(value), sizeof(value));
+}
+
 std::uint8_t ReadU8(std::span<const std::byte> buffer, std::size_t offset) {
     return static_cast<std::uint8_t>(ReadLittleEndian(buffer, offset, sizeof(std::uint8_t)));
 }
@@ -76,6 +83,11 @@ std::uint32_t ReadU32(std::span<const std::byte> buffer, std::size_t offset) {
 
 std::uint64_t ReadU64(std::span<const std::byte> buffer, std::size_t offset) {
     return ReadLittleEndian(buffer, offset, sizeof(std::uint64_t));
+}
+
+float ReadF32(std::span<const std::byte> buffer, std::size_t offset) {
+    return std::bit_cast<float>(
+        static_cast<std::uint32_t>(ReadLittleEndian(buffer, offset, sizeof(float))));
 }
 
 std::int32_t ReadI32(std::span<const std::byte> buffer, std::size_t offset) {

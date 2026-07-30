@@ -58,7 +58,9 @@ public:
 
     /// Largest record that can ever be stored: a full page minus the header and
     /// one slot. 4096 - 12 - 4 = 4080 bytes.
-    static constexpr std::size_t kMaxRecordSize = kPageSize - kHeaderSize - kSlotSize;
+    static constexpr std::size_t kMaxRecordSize = minidb::kMaxRecordSize;
+    static_assert(kMaxRecordSize == kPageSize - kHeaderSize - kSlotSize,
+                  "el límite de constants.hpp no coincide con esta disposición de página");
 
     explicit TablePage(std::span<std::byte, kPageSize> page) : page_(page) {}
 

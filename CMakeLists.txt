@@ -53,6 +53,8 @@ add_library(minidb_core
     src/execution/blocking_operators.cpp
     src/execution/record_batch.cpp
     src/execution/vectorized_operators.cpp
+    src/vector/distance.cpp
+    src/execution/knn_operators.cpp
     src/execution/execution_engine.cpp
     src/database/database.cpp)
 
@@ -81,6 +83,8 @@ if(MINIDB_BUILD_TESTS)
         tests/blocking_operators_test.cpp
         tests/evaluation_test.cpp
         tests/vectorized_test.cpp
+        tests/distance_test.cpp
+        tests/knn_test.cpp
         tests/integration_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)

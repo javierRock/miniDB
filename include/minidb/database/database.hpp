@@ -79,6 +79,11 @@ public:
     void SetVectorizedEnabled(bool enabled);
     [[nodiscard]] bool VectorizedEnabled() const;
 
+    /// Whether a NEAREST query ranks with a bounded Top-k heap or by sorting all
+    /// distances. See ExecutionEngine::SetTopKEnabled.
+    void SetTopKEnabled(bool enabled);
+    [[nodiscard]] bool TopKEnabled() const;
+
 private:
     /// The statement itself, without the measuring. Execute wraps it.
     [[nodiscard]] QueryResult ExecuteParsed(const std::string& sql);

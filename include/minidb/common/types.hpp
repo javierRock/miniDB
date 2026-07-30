@@ -42,6 +42,21 @@ enum class PageType : std::uint8_t {
 enum class ColumnType : std::uint8_t {
     kInteger = 1,
     kVarchar = 2,
+    /// Fixed-dimension array of 32-bit floats, for similarity search. The
+    /// declared dimension is stored in Column::max_length, as VARCHAR stores its
+    /// byte limit there.
+    kVector = 3,
+};
+
+/// How the distance between two vectors is measured in a nearest neighbour query.
+///
+/// This lives next to CompareOperator because it belongs to the query, not to the
+/// implementation: the parser needs it to represent `USING COSINE`, and the metric
+/// functions themselves live in `minidb/vector/distance.hpp`.
+enum class DistanceMetric : std::uint8_t {
+    kEuclidean,
+    kCosine,
+    kDotProduct,
 };
 
 /// Comparison operators accepted in a WHERE clause.

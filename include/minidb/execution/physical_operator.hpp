@@ -24,6 +24,14 @@ struct OperatorMetrics {
     /// against next_calls is the clearest picture of what batching buys: the same
     /// rows delivered in a handful of calls instead of one per record.
     std::uint64_t batches_produced = 0;
+    /// Vector distances computed, for a nearest neighbour operator. It is the
+    /// unit of work of a similarity search, and unlike elapsed time it is
+    /// deterministic.
+    std::uint64_t distance_calculations = 0;
+    /// Candidates the ranking actually held on to. For a bounded Top-k heap it is
+    /// far below the number of distances computed; for a full sort the two are
+    /// equal, because it keeps everything. That gap is the space the bound saves.
+    std::uint64_t candidates_admitted = 0;
 };
 
 /// Base class of every physical operator, following the Volcano model.
@@ -96,7 +104,8 @@ public:
     /// What this operator did. The counters accumulate over its lifetime, and
     /// since a plan is built fresh for each statement, that is per statement.
     [[nodiscard]] OperatorMetrics Metrics() const {
-        return OperatorMetrics{Name(), next_calls_, rows_produced_, batches_produced_};
+        return OperatorMetrics{Name(),           next_calls_,          rows_produced_,
+                               batches_produced_, distance_calculations_, candidates_admitted_};
     }
 
 protected:
@@ -120,6 +129,22 @@ protected:
         rows_produced_ += rows;
     }
 
+    /// Counts one vector distance computation. Called from the exact point where
+    /// the arithmetic happens, so the counter cannot drift from the work done.
+    void CountDistance() { ++distance_calculations_; }
+
+    /// Counts one candidate kept by a ranking.
+    void CountCandidate() { ++candidates_admitted_; }
+
+    /// Clears the counters, for an operator that starts over on every Open.
+    void ResetCounters() {
+        next_calls_ = 0;
+        rows_produced_ = 0;
+        batches_produced_ = 0;
+        distance_calculations_ = 0;
+        candidates_admitted_ = 0;
+    }
+
     /// Counts a Next() call whose record was already counted when its batch was
     /// produced.
     ///
@@ -135,6 +160,8 @@ private:
     std::uint64_t next_calls_ = 0;
     std::uint64_t rows_produced_ = 0;
     std::uint64_t batches_produced_ = 0;
+    std::uint64_t distance_calculations_ = 0;
+    std::uint64_t candidates_admitted_ = 0;
 };
 
 }  // namespace minidb

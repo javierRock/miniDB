@@ -193,6 +193,15 @@ void Database::SetVectorizedEnabled(bool enabled) {
 
 bool Database::VectorizedEnabled() const { return vectorized_; }
 
+void Database::SetTopKEnabled(bool enabled) {
+    if (engine_ == nullptr) {
+        throw QueryError("No existe ninguna tabla; use CREATE TABLE primero");
+    }
+    engine_->SetTopKEnabled(enabled);
+}
+
+bool Database::TopKEnabled() const { return engine_ == nullptr || engine_->TopKEnabled(); }
+
 std::uint32_t Database::TablePageCount() const {
     return heap_ == nullptr ? 0 : heap_->PageCountInChain();
 }

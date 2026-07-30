@@ -35,6 +35,16 @@ struct QueryResult {
     std::uint64_t pages_read = 0;
     std::uint64_t buffer_hits = 0;
     std::uint64_t buffer_misses = 0;
+
+    /// Total vector distances computed by the plan. Zero for every statement that
+    /// is not a nearest neighbour query.
+    [[nodiscard]] std::uint64_t DistanceCalculations() const {
+        std::uint64_t total = 0;
+        for (const OperatorMetrics& op : metrics) {
+            total += op.distance_calculations;
+        }
+        return total;
+    }
 };
 
 /// Turns a parsed statement into work against the storage layer.
@@ -79,6 +89,15 @@ public:
     void SetVectorizedEnabled(bool enabled) { vectorized_enabled_ = enabled; }
     [[nodiscard]] bool VectorizedEnabled() const { return vectorized_enabled_; }
 
+    /// Chooses how a nearest neighbour query ranks its candidates: with a bounded
+    /// heap of size `k` (the default) or by sorting all `n` distances.
+    ///
+    /// Both are exact and both examine every record, so they return the same rows.
+    /// The switch exists so the two can be measured against each other on the same
+    /// data; the bounded heap is the one the system uses normally.
+    void SetTopKEnabled(bool enabled) { topk_enabled_ = enabled; }
+    [[nodiscard]] bool TopKEnabled() const { return topk_enabled_; }
+
     /// Builds the physical plan for a SELECT without running it. Exposed so the
     /// tests can assert which plan was chosen.
     [[nodiscard]] std::unique_ptr<PhysicalOperator> BuildPlan(const SelectStatement& select) const;
@@ -117,6 +136,7 @@ private:
     /// Only ever false while measuring; see SetIndexEnabled.
     bool index_enabled_ = true;
     bool vectorized_enabled_ = false;
+    bool topk_enabled_ = true;
 };
 
 }  // namespace minidb

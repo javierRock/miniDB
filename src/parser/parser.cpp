@@ -1,12 +1,26 @@
 #include "minidb/parser/parser.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
-#include <limits>
 
 #include "minidb/common/constants.hpp"
 #include "minidb/common/types.hpp"
 
 namespace minidb {
+namespace {
+
+/// Metric names are keywords in spirit but identifiers in the grammar, so they
+/// are matched without regard to case like every other keyword.
+[[nodiscard]] bool EqualsIgnoreCase(const std::string& left, const char* right) {
+    const std::string_view other(right);
+    return std::ranges::equal(left, other, [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) ==
+               std::tolower(static_cast<unsigned char>(b));
+    });
+}
+
+}  // namespace
 
 Statement Parser::Parse(const std::string& sql) {
     Parser parser(Tokenizer(sql).Tokenize());
@@ -104,8 +118,19 @@ Column Parser::ParseColumnDefinition() {
         }
         column.max_length = static_cast<std::uint16_t>(length);
         Expect(TokenType::kRightParenthesis);
+    } else if (Match(TokenType::kVector)) {
+        column.type = ColumnType::kVector;
+        Expect(TokenType::kLeftParenthesis);
+        const std::int32_t dimension = ParseInteger("la dimensión del VECTOR");
+        if (dimension <= 0 || static_cast<std::size_t>(dimension) > kMaxVectorDimension) {
+            throw QueryError("VECTOR(" + std::to_string(dimension) + ") en la columna '" +
+                             column.name + "': la dimensión debe estar entre 1 y " +
+                             std::to_string(kMaxVectorDimension));
+        }
+        column.max_length = static_cast<std::uint16_t>(dimension);
+        Expect(TokenType::kRightParenthesis);
     } else {
-        throw Unexpected("INT o VARCHAR");
+        throw Unexpected("INT, VARCHAR o VECTOR");
     }
 
     if (Match(TokenType::kPrimary)) {
@@ -131,6 +156,43 @@ CreateTableStatement Parser::ParseCreateTable() {
     return statement;
 }
 
+float Parser::ParseFloat(const char* what) {
+    // An integer literal is accepted where a float is expected, so `[1, 0]` does
+    // not have to be written `[1.0, 0.0]`.
+    if (!Check(TokenType::kFloatLiteral) && !Check(TokenType::kIntegerLiteral)) {
+        throw Unexpected(std::string("un número para ") + what);
+    }
+    const Token& token = tokens_[cursor_++];
+
+    float value = 0.0F;
+    const auto* first = token.text.data();
+    const auto* last = first + token.text.size();
+    const auto result = std::from_chars(first, last, value);
+
+    if (result.ec != std::errc{} || result.ptr != last) {
+        throw QueryError("El número '" + token.text + "' en la posición " +
+                         std::to_string(token.position) +
+                         " no es un valor válido de coma flotante de 32 bits");
+    }
+    return value;
+}
+
+Vector Parser::ParseVectorLiteral() {
+    Expect(TokenType::kLeftBracket);
+
+    Vector vector;
+    do {
+        if (vector.size() >= kMaxVectorDimension) {
+            throw QueryError("Un literal de vector no puede tener más de " +
+                             std::to_string(kMaxVectorDimension) + " componentes");
+        }
+        vector.push_back(ParseFloat("una componente del vector"));
+    } while (Match(TokenType::kComma));
+
+    Expect(TokenType::kRightBracket);
+    return vector;
+}
+
 Value Parser::ParseValue() {
     if (Check(TokenType::kIntegerLiteral)) {
         return Value{ParseInteger("un valor")};
@@ -138,7 +200,10 @@ Value Parser::ParseValue() {
     if (Check(TokenType::kStringLiteral)) {
         return Value{tokens_[cursor_++].text};
     }
-    throw Unexpected("un número o una cadena entre comillas simples");
+    if (Check(TokenType::kLeftBracket)) {
+        return Value{ParseVectorLiteral()};
+    }
+    throw Unexpected("un número, una cadena entre comillas simples o un vector entre corchetes");
 }
 
 InsertStatement Parser::ParseInsert() {
@@ -215,6 +280,41 @@ std::optional<OrderByClause> Parser::ParseOptionalOrderBy() {
     return clause;
 }
 
+std::optional<NearestClause> Parser::ParseOptionalNearest() {
+    if (!Match(TokenType::kNearest)) {
+        return std::nullopt;
+    }
+
+    NearestClause clause;
+    clause.column = ParseIdentifier("columna");
+    Expect(TokenType::kTo);
+    clause.query = ParseVectorLiteral();
+
+    if (Match(TokenType::kUsing)) {
+        const std::string metric = ParseIdentifier("métrica");
+        if (EqualsIgnoreCase(metric, "EUCLIDEAN") || EqualsIgnoreCase(metric, "EUCLIDIANA")) {
+            clause.metric = DistanceMetric::kEuclidean;
+        } else if (EqualsIgnoreCase(metric, "COSINE") || EqualsIgnoreCase(metric, "COSENO")) {
+            clause.metric = DistanceMetric::kCosine;
+        } else if (EqualsIgnoreCase(metric, "DOT") || EqualsIgnoreCase(metric, "PRODUCTO")) {
+            clause.metric = DistanceMetric::kDotProduct;
+        } else {
+            throw QueryError("Métrica desconocida '" + metric +
+                             "'; se admiten EUCLIDEAN, COSINE y DOT");
+        }
+    }
+
+    // LIMIT is what supplies k, so it is mandatory here. A similarity search with
+    // no bound would rank the entire table, which is never the intent.
+    Expect(TokenType::kLimit);
+    const std::int32_t k = ParseInteger("el número de vecinos (LIMIT)");
+    if (k < 0) {
+        throw QueryError("LIMIT no puede ser negativo");
+    }
+    clause.k = static_cast<std::size_t>(k);
+    return clause;
+}
+
 SelectStatement Parser::ParseSelect() {
     Expect(TokenType::kSelect);
 
@@ -232,6 +332,26 @@ SelectStatement Parser::ParseSelect() {
     statement.where = ParseOptionalWhere();
     statement.group_by = ParseOptionalGroupBy();
     statement.order_by = ParseOptionalOrderBy();
+    statement.nearest = ParseOptionalNearest();
+
+    if (statement.nearest.has_value()) {
+        // A nearest neighbour query already defines the order of its results —
+        // ascending distance — so an ORDER BY on top would either be redundant or
+        // contradict it. GROUP BY collapses the rows the ranking is made of.
+        if (statement.order_by.has_value()) {
+            throw QueryError(
+                "NEAREST ya ordena por distancia; no se admite ORDER BY en la misma consulta");
+        }
+        if (statement.group_by.has_value()) {
+            throw QueryError("No se admite GROUP BY en una consulta de vecinos más cercanos");
+        }
+    } else if (Check(TokenType::kLimit)) {
+        // LIMIT exists only to supply k. Accepting it on its own would suggest a
+        // general LIMIT operator, which is not implemented.
+        throw QueryError(
+            "LIMIT solo se admite en una consulta de vecinos más cercanos "
+            "(NEAREST <columna> TO [...] LIMIT <k>)");
+    }
 
     // With GROUP BY the output columns are the grouping column and COUNT(*),
     // not the table's columns, so `SELECT *` would be misleading rather than

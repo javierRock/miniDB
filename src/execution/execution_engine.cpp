@@ -6,6 +6,8 @@
 #include "minidb/execution/aggregate_operator.hpp"
 #include "minidb/execution/filter_operator.hpp"
 #include "minidb/execution/index_scan_operator.hpp"
+#include "minidb/execution/knn_full_sort_operator.hpp"
+#include "minidb/execution/knn_scan_operator.hpp"
 #include "minidb/execution/projection_operator.hpp"
 #include "minidb/execution/sequential_scan_operator.hpp"
 #include "minidb/execution/sort_operator.hpp"
@@ -69,6 +71,25 @@ std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildScan(
 std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildPlan(const SelectStatement& select) const {
     const Schema& schema = catalog_.GetSchema();
 
+    // A vector has no single natural order and cannot be a grouping key, so both
+    // are rejected while building the plan. Leaving it to the comparator would make
+    // the error depend on how many rows there are — a query over one row would
+    // succeed and the same query over two would fail.
+    const auto reject_vector_column = [&schema](const std::string& name, const char* clause) {
+        const auto index = schema.FindColumn(name);
+        if (index.has_value() && schema.GetColumn(*index).type == ColumnType::kVector) {
+            throw QueryError("La columna '" + schema.GetColumn(*index).name +
+                             "' es VECTOR y no admite " + clause +
+                             "; use una consulta de vecinos más cercanos (NEAREST ... TO ...)");
+        }
+    };
+    if (select.order_by.has_value()) {
+        reject_vector_column(select.order_by->column, "ORDER BY");
+    }
+    if (select.group_by.has_value()) {
+        reject_vector_column(select.group_by->column, "GROUP BY");
+    }
+
     std::unique_ptr<PhysicalOperator> plan = BuildScan(select.where);
     // What the operator above sees. It starts as the table's columns and changes
     // only where an operator reshapes the tuple, which is what lets ORDER BY be
@@ -76,6 +97,19 @@ std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildPlan(const SelectStateme
     std::vector<std::string> input_names;
     for (const Column& column : schema.Columns()) {
         input_names.push_back(column.name);
+    }
+
+    if (select.nearest.has_value()) {
+        // The ranking replaces GROUP BY and ORDER BY, which the parser has already
+        // rejected in this position, so the k-NN operator sits directly under the
+        // projection. Both strategies are exact and examine every record; the
+        // switch chooses how much ranking work is done on top.
+        std::unique_ptr<PhysicalOperator> knn =
+            topk_enabled_
+                ? std::make_unique<KnnScanOperator>(std::move(plan), schema, *select.nearest)
+                : std::make_unique<KnnFullSortOperator>(std::move(plan), schema, *select.nearest);
+        input_names = knn->OutputColumnNames();
+        return std::make_unique<ProjectionOperator>(std::move(knn), input_names, select.columns);
     }
 
     if (select.group_by.has_value()) {

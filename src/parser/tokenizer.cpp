@@ -22,7 +22,9 @@ const std::unordered_map<std::string, TokenType>& Keywords() {
         {"KEY", TokenType::kKey},       {"ORDER", TokenType::kOrder},
         {"GROUP", TokenType::kGroup},   {"BY", TokenType::kBy},
         {"ASC", TokenType::kAsc},       {"DESC", TokenType::kDesc},
-        {"COUNT", TokenType::kCount},
+        {"COUNT", TokenType::kCount},   {"VECTOR", TokenType::kVector},
+        {"NEAREST", TokenType::kNearest}, {"TO", TokenType::kTo},
+        {"USING", TokenType::kUsing},   {"LIMIT", TokenType::kLimit},
     };
     return keywords;
 }
@@ -50,6 +52,7 @@ std::string TokenTypeName(TokenType type) {
     switch (type) {
         case TokenType::kIdentifier: return "un identificador";
         case TokenType::kIntegerLiteral: return "un número entero";
+        case TokenType::kFloatLiteral: return "un número decimal";
         case TokenType::kStringLiteral: return "una cadena";
         case TokenType::kCreate: return "CREATE";
         case TokenType::kTable: return "TABLE";
@@ -72,6 +75,11 @@ std::string TokenTypeName(TokenType type) {
         case TokenType::kAsc: return "ASC";
         case TokenType::kDesc: return "DESC";
         case TokenType::kCount: return "COUNT";
+        case TokenType::kVector: return "VECTOR";
+        case TokenType::kNearest: return "NEAREST";
+        case TokenType::kTo: return "TO";
+        case TokenType::kUsing: return "USING";
+        case TokenType::kLimit: return "LIMIT";
         case TokenType::kEqual: return "'='";
         case TokenType::kNotEqual: return "'!='";
         case TokenType::kLess: return "'<'";
@@ -83,6 +91,8 @@ std::string TokenTypeName(TokenType type) {
         case TokenType::kComma: return "','";
         case TokenType::kAsterisk: return "'*'";
         case TokenType::kSemicolon: return "';'";
+        case TokenType::kLeftBracket: return "'['";
+        case TokenType::kRightBracket: return "']'";
         case TokenType::kEndOfInput: return "el final de la sentencia";
     }
     return "un token desconocido";
@@ -119,7 +129,38 @@ Token Tokenizer::ReadNumber() {
     while (!AtEnd() && std::isdigit(static_cast<unsigned char>(Peek())) != 0) {
         ++cursor_;
     }
-    return Token{TokenType::kIntegerLiteral, input_.substr(start, cursor_ - start), start + 1};
+
+    // A decimal point or an exponent makes it a float literal. The two are kept
+    // apart so that a vector component is never read as an int and a dimension is
+    // never written with a decimal point.
+    bool is_float = false;
+    if (!AtEnd() && Peek() == '.') {
+        is_float = true;
+        ++cursor_;
+        while (!AtEnd() && std::isdigit(static_cast<unsigned char>(Peek())) != 0) {
+            ++cursor_;
+        }
+    }
+    if (!AtEnd() && (Peek() == 'e' || Peek() == 'E')) {
+        const std::size_t exponent_start = cursor_;
+        ++cursor_;
+        if (!AtEnd() && (Peek() == '+' || Peek() == '-')) {
+            ++cursor_;
+        }
+        if (!AtEnd() && std::isdigit(static_cast<unsigned char>(Peek())) != 0) {
+            is_float = true;
+            while (!AtEnd() && std::isdigit(static_cast<unsigned char>(Peek())) != 0) {
+                ++cursor_;
+            }
+        } else {
+            // Not an exponent after all: `1e` is the number 1 followed by the
+            // identifier `e`, so the cursor goes back.
+            cursor_ = exponent_start;
+        }
+    }
+
+    return Token{is_float ? TokenType::kFloatLiteral : TokenType::kIntegerLiteral,
+                 input_.substr(start, cursor_ - start), start + 1};
 }
 
 Token Tokenizer::ReadString() {
@@ -167,6 +208,8 @@ Token Tokenizer::ReadOperatorOrPunctuation() {
         case ',': return make(TokenType::kComma, 1);
         case '*': return make(TokenType::kAsterisk, 1);
         case ';': return make(TokenType::kSemicolon, 1);
+        case '[': return make(TokenType::kLeftBracket, 1);
+        case ']': return make(TokenType::kRightBracket, 1);
         case '<':
             if (PeekNext() == '=') return make(TokenType::kLessEqual, 2);
             if (PeekNext() == '>') return make(TokenType::kNotEqual, 2);

@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
+#include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -97,6 +102,9 @@ void PrintPlan(const QueryResult& result) {
         if (op.batches_produced > 0) {
             std::cout << "  lotes=" << op.batches_produced;
         }
+        if (op.distance_calculations > 0) {
+            std::cout << "  distancias=" << op.distance_calculations;
+        }
         std::cout << '\n';
     }
 }
@@ -111,10 +119,14 @@ void PrintCost(const QueryResult& result) {
 
 void PrintHelp() {
     std::cout << R"(SQL admitido:
-  CREATE TABLE <tabla> (<col> INT [PRIMARY KEY] | <col> VARCHAR(<n>), ...);
-  INSERT INTO <tabla> VALUES (<v1>, <v2>, ...);
+  CREATE TABLE <tabla> (<col> INT [PRIMARY KEY] | <col> VARCHAR(<n>)
+                        | <col> VECTOR(<d>), ...);
+  INSERT INTO <tabla> VALUES (<v1>, <v2>, ...);   -- un vector: [0.1, 0.9, ...]
   SELECT * | <col> | COUNT(*), ... FROM <tabla> [WHERE <col> <op> <valor>]
          [GROUP BY <col>] [ORDER BY <col> [ASC|DESC]];
+  SELECT ... FROM <tabla> [WHERE ...]
+         NEAREST <col_vector> TO [<v1>, ...] [USING EUCLIDEAN|COSINE|DOT]
+         LIMIT <k>;
   UPDATE <tabla> SET <col> = <valor> [, ...] [WHERE <col> <op> <valor>];
   DELETE FROM <tabla> [WHERE <col> <op> <valor>];
 
@@ -131,8 +143,11 @@ Comandos internos:
   .flush    Sincroniza todas las páginas sucias
   .indice [on|off]      Activa o desactiva el uso del índice (para medir)
   .vectorizado [on|off] Cambia entre ejecución tupla a tupla y por lotes
+  .topk [on|off]        Top-k acotado u orden completo en las consultas NEAREST
   .bench [n]            Compara n búsquedas por clave con y sin índice
   .benchvec [n]         Compara los dos modelos de ejecución
+  .knnbench [k] [n]     Compara Top-k acotado y orden completo en n consultas
+  .knncsv <ruta> [k] [n]  Igual, exportando una fila CSV por consulta
   .exit     Sincroniza y sale
 
 Ejemplos:
@@ -156,10 +171,19 @@ void PrintSchema(const Database& db) {
     std::cout << "Tabla: " << catalog.TableName() << " (" << catalog.RecordCount()
               << " registros)\n";
     for (const Column& column : schema.Columns()) {
-        std::cout << "  " << column.name << ' '
-                  << (column.type == ColumnType::kInteger
-                          ? "INT"
-                          : "VARCHAR(" + std::to_string(column.max_length) + ")")
+        std::string type_name;
+        switch (column.type) {
+            case ColumnType::kInteger:
+                type_name = "INT";
+                break;
+            case ColumnType::kVarchar:
+                type_name = "VARCHAR(" + std::to_string(column.max_length) + ")";
+                break;
+            case ColumnType::kVector:
+                type_name = "VECTOR(" + std::to_string(column.max_length) + ")";
+                break;
+        }
+        std::cout << "  " << column.name << ' ' << type_name
                   << (column.is_primary_key ? " PRIMARY KEY" : "") << '\n';
     }
 }
@@ -457,6 +481,278 @@ void RunVectorizedBenchmark(Database& db, std::size_t repetitions) {
     }
 }
 
+/// Everything a nearest neighbour benchmark needs to know about the table.
+struct VectorColumnInfo {
+    std::string name;
+    std::size_t dimension = 0;
+};
+
+/// Finds the table's VECTOR column, or reports why there is nothing to measure.
+[[nodiscard]] std::optional<VectorColumnInfo> FindVectorColumn(const Database& db) {
+    if (!db.HasTable()) {
+        std::cout << "No hay ninguna tabla. Use CREATE TABLE con una columna VECTOR.\n";
+        return std::nullopt;
+    }
+    const Schema& schema = db.GetCatalog().GetSchema();
+    for (const Column& column : schema.Columns()) {
+        if (column.type == ColumnType::kVector) {
+            return VectorColumnInfo{column.name, column.max_length};
+        }
+    }
+    std::cout << "La tabla '" << db.GetCatalog().TableName()
+              << "' no tiene ninguna columna VECTOR, así que no hay búsqueda por similitud"
+                 " que medir.\n";
+    return std::nullopt;
+}
+
+/// Query vectors for the benchmarks, drawn from a fixed seed.
+///
+/// Generated here rather than passed in so that both strategies are measured
+/// against byte-identical queries and the whole experiment is reproducible from
+/// the binary alone. std::mt19937 with an explicit seed is portable across
+/// platforms, unlike a default-constructed random device.
+[[nodiscard]] std::vector<Vector> MakeQueryVectors(std::size_t count, std::size_t dimension,
+                                                   std::uint32_t seed = 42) {
+    std::mt19937 generator(seed);
+    std::uniform_real_distribution<float> component(0.0F, 1.0F);
+
+    std::vector<Vector> queries;
+    queries.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        Vector query;
+        query.reserve(dimension);
+        for (std::size_t j = 0; j < dimension; ++j) {
+            query.push_back(component(generator));
+        }
+        queries.push_back(std::move(query));
+    }
+    return queries;
+}
+
+/// Writes a nearest neighbour query in the system's own SQL.
+[[nodiscard]] std::string KnnQuery(const Database& db, const std::string& column,
+                                   const Vector& query, std::size_t k) {
+    std::string sql = "SELECT * FROM " + db.GetCatalog().TableName() + " NEAREST " + column + " TO [";
+    for (std::size_t i = 0; i < query.size(); ++i) {
+        sql += std::format("{}{:.6f}", i == 0 ? "" : ",", query[i]);
+    }
+    return sql + "] LIMIT " + std::to_string(k);
+}
+
+/// One measured execution of a k-NN query.
+struct KnnSample {
+    double elapsed_ms = 0.0;
+    std::uint64_t distances = 0;
+    std::uint64_t pages_read = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::size_t rows = 0;
+};
+
+/// Runs one batch of queries under one strategy. `topk` chooses the bounded heap
+/// or the full sort; nothing else differs between the two rounds.
+[[nodiscard]] std::vector<KnnSample> RunKnnBatch(Database& db, const std::string& column,
+                                                 const std::vector<Vector>& queries, std::size_t k,
+                                                 bool topk) {
+    db.SetTopKEnabled(topk);
+
+    // Warm-up: the first query of a cold run pays for reading pages that every
+    // later query finds resident, and it would distort the minimum.
+    if (!queries.empty()) {
+        (void)db.Execute(KnnQuery(db, column, queries.front(), k));
+    }
+
+    std::vector<KnnSample> samples;
+    samples.reserve(queries.size());
+    for (const Vector& query : queries) {
+        const QueryResult result = db.Execute(KnnQuery(db, column, query, k));
+        samples.push_back(KnnSample{result.elapsed_ms, result.DistanceCalculations(),
+                                    result.pages_read, result.buffer_hits, result.buffer_misses,
+                                    result.rows.size()});
+    }
+    return samples;
+}
+
+/// Percentile by nearest rank over an already sorted sample.
+[[nodiscard]] double Percentile(const std::vector<double>& sorted, double fraction) {
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    const auto index = static_cast<std::size_t>(fraction * static_cast<double>(sorted.size()));
+    return sorted[std::min(index, sorted.size() - 1)];
+}
+
+struct KnnStatistics {
+    double mean = 0.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+    double deviation = 0.0;
+    double p50 = 0.0;
+    double p95 = 0.0;
+    double p99 = 0.0;
+    double queries_per_second = 0.0;
+    std::uint64_t distances = 0;
+    std::uint64_t pages_read = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+};
+
+[[nodiscard]] KnnStatistics Summarise(const std::vector<KnnSample>& samples) {
+    KnnStatistics stats;
+    if (samples.empty()) {
+        return stats;
+    }
+
+    std::vector<double> latencies;
+    latencies.reserve(samples.size());
+    for (const KnnSample& sample : samples) {
+        latencies.push_back(sample.elapsed_ms);
+        stats.distances += sample.distances;
+        stats.pages_read += sample.pages_read;
+        stats.hits += sample.hits;
+        stats.misses += sample.misses;
+    }
+    std::ranges::sort(latencies);
+
+    double total = 0.0;
+    for (double latency : latencies) {
+        total += latency;
+    }
+    const auto count = static_cast<double>(latencies.size());
+    stats.mean = total / count;
+
+    double squared = 0.0;
+    for (double latency : latencies) {
+        squared += (latency - stats.mean) * (latency - stats.mean);
+    }
+    stats.deviation = std::sqrt(squared / count);
+
+    stats.minimum = latencies.front();
+    stats.maximum = latencies.back();
+    stats.p50 = Percentile(latencies, 0.50);
+    stats.p95 = Percentile(latencies, 0.95);
+    stats.p99 = Percentile(latencies, 0.99);
+    stats.queries_per_second = stats.mean > 0.0 ? 1000.0 / stats.mean : 0.0;
+    return stats;
+}
+
+/// Compares the bounded Top-k heap against the full sort on the same queries.
+void RunKnnBenchmark(Database& db, std::size_t k, std::size_t query_count) {
+    const auto column = FindVectorColumn(db);
+    if (!column.has_value()) {
+        return;
+    }
+
+    const std::vector<Vector> queries = MakeQueryVectors(query_count, column->dimension);
+    const bool restore = db.TopKEnabled();
+
+    const KnnStatistics topk = Summarise(RunKnnBatch(db, column->name, queries, k, true));
+    const KnnStatistics full = Summarise(RunKnnBatch(db, column->name, queries, k, false));
+    db.SetTopKEnabled(restore);
+
+    std::cout << "Búsqueda exacta de vecinos más cercanos\n"
+              << "Tabla: " << db.GetCatalog().TableName() << "   "
+              << db.GetCatalog().RecordCount() << " vectores de dimensión " << column->dimension
+              << "   k = " << k << "   " << query_count << " consultas\n\n";
+
+    const std::string separator =
+        "+-----------------------------+-----------+-----------+-----------+-----------+-----------+";
+    std::cout << separator << '\n'
+              << "| estrategia                  | media     | p50       | p95       | p99       "
+                 "| cons/s    |\n"
+              << separator << '\n';
+
+    const auto row = [](const char* label, const KnnStatistics& stats) {
+        std::cout << "| " << Pad(label, 27) << " | "
+                  << Pad(std::format("{:.4f} ms", stats.mean), 9) << " | "
+                  << Pad(std::format("{:.4f}", stats.p50), 9) << " | "
+                  << Pad(std::format("{:.4f}", stats.p95), 9) << " | "
+                  << Pad(std::format("{:.4f}", stats.p99), 9) << " | "
+                  << Pad(std::format("{:.0f}", stats.queries_per_second), 9) << " |\n";
+    };
+    row("Top-k acotado (O(n log k))", topk);
+    row("Orden completo (O(n log n))", full);
+    std::cout << separator << '\n';
+
+    std::cout << std::format("\nLatencia mínima y máxima: Top-k {:.4f}/{:.4f} ms, "
+                             "orden completo {:.4f}/{:.4f} ms.\n",
+                             topk.minimum, topk.maximum, full.minimum, full.maximum);
+    std::cout << std::format("Desviación estándar: Top-k {:.4f} ms, orden completo {:.4f} ms.\n",
+                             topk.deviation, full.deviation);
+    std::cout << "Distancias calculadas: " << topk.distances << " y " << full.distances
+              << ". Son iguales a propósito: las dos estrategias son exactas y examinan\n"
+                 "todos los registros; lo que cambia es cuánto ordenan después.\n";
+    std::cout << "Páginas leídas del disco: " << topk.pages_read << " y " << full.pages_read
+              << ". Aciertos/fallos del buffer: " << topk.hits << "/" << topk.misses << " y "
+              << full.hits << "/" << full.misses << ".\n";
+    if (topk.mean > 0.0) {
+        std::cout << std::format("Aceleración del Top-k acotado: {:.2f}x.\n", full.mean / topk.mean);
+    }
+}
+
+/// Appends one CSV row per query and strategy, for the experiment scripts.
+void RunKnnCsv(Database& db, const std::string& path, std::size_t k, std::size_t query_count) {
+    const auto column = FindVectorColumn(db);
+    if (!column.has_value()) {
+        return;
+    }
+
+    const std::vector<Vector> queries = MakeQueryVectors(query_count, column->dimension);
+    const bool restore = db.TopKEnabled();
+    const std::vector<KnnSample> topk = RunKnnBatch(db, column->name, queries, k, true);
+    const std::vector<KnnSample> full = RunKnnBatch(db, column->name, queries, k, false);
+    db.SetTopKEnabled(restore);
+
+    const bool write_header = !std::filesystem::exists(path);
+    std::ofstream csv(path, std::ios::app);
+    if (!csv) {
+        std::cout << "No se pudo abrir '" << path << "' para escritura.\n";
+        return;
+    }
+    if (write_header) {
+        csv << "estrategia,vectores,dimension,k,consulta,latencia_ms,distancias,"
+               "registros_examinados,page_reads,buffer_hits,buffer_misses,filas\n";
+    }
+
+    const auto write = [&](const char* label, const std::vector<KnnSample>& samples) {
+        for (std::size_t i = 0; i < samples.size(); ++i) {
+            const KnnSample& sample = samples[i];
+            csv << label << ',' << db.GetCatalog().RecordCount() << ',' << column->dimension << ','
+                << k << ',' << i << ',' << std::format("{:.6f}", sample.elapsed_ms) << ','
+                << sample.distances << ',' << sample.distances << ',' << sample.pages_read << ','
+                << sample.hits << ',' << sample.misses << ',' << sample.rows << '\n';
+        }
+    };
+    write("topk", topk);
+    write("fullsort", full);
+
+    std::cout << "Escritas " << (topk.size() + full.size()) << " filas en " << path << ".\n";
+}
+
+void RunTopKCommand(Database& db, const std::string& argument) {
+    if (!db.HasTable()) {
+        std::cout << "No hay ninguna tabla definida.\n";
+        return;
+    }
+
+    if (argument == "on") {
+        db.SetTopKEnabled(true);
+    } else if (argument == "off") {
+        db.SetTopKEnabled(false);
+    } else if (!argument.empty()) {
+        std::cout << "Uso: .topk [on|off]\n";
+        return;
+    }
+
+    if (db.TopKEnabled()) {
+        std::cout << "Selección Top-k acotada: ACTIVADA (KnnScanOperator, O(n log k))\n";
+    } else {
+        std::cout << "Selección Top-k acotada: desactivada\n"
+                     "Las consultas NEAREST ordenarán las n distancias completas\n"
+                     "(KnnFullSortOperator, O(n log n)). Es la línea base de la evaluación.\n";
+    }
+}
+
 void RunIndexCommand(Database& db, const std::string& argument) {
     if (!db.HasTable()) {
         std::cout << "No hay ninguna tabla definida.\n";
@@ -504,6 +800,31 @@ bool RunInternalCommand(const std::string& full_command, Database& db,
         RunIndexCommand(db, argument);
     } else if (command == ".vectorizado") {
         RunVectorizedCommand(db, argument);
+    } else if (command == ".topk") {
+        RunTopKCommand(db, argument);
+    } else if (command == ".knnbench" || command == ".knncsv") {
+        // .knnbench [k] [consultas]      .knncsv <ruta> [k] [consultas]
+        std::istringstream arguments(argument);
+        std::string path;
+        if (command == ".knncsv" && !(arguments >> path)) {
+            std::cout << "Uso: .knncsv <ruta> [k] [consultas]\n";
+            return true;
+        }
+
+        std::size_t k = 10;
+        std::size_t queries = 20;
+        arguments >> k;
+        arguments >> queries;
+        if (k == 0 || queries == 0) {
+            std::cout << "k y el número de consultas deben ser mayores que cero.\n";
+            return true;
+        }
+
+        if (command == ".knnbench") {
+            RunKnnBenchmark(db, k, queries);
+        } else {
+            RunKnnCsv(db, path, k, queries);
+        }
     } else if (command == ".bench" || command == ".benchvec") {
         std::size_t repetitions = command == ".bench" ? 100 : 20;
         if (!argument.empty()) {

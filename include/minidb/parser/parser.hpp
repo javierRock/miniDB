@@ -59,8 +59,11 @@ private:
     [[nodiscard]] std::optional<Condition> ParseOptionalWhere();
     [[nodiscard]] std::optional<GroupByClause> ParseOptionalGroupBy();
     [[nodiscard]] std::optional<OrderByClause> ParseOptionalOrderBy();
+    [[nodiscard]] std::optional<NearestClause> ParseOptionalNearest();
     /// A column name or COUNT(*), which yields the pseudo-name "COUNT(*)".
     [[nodiscard]] std::string ParseSelectItem();
+    [[nodiscard]] Vector ParseVectorLiteral();
+    [[nodiscard]] float ParseFloat(const char* what);
     [[nodiscard]] CompareOperator ParseCompareOperator();
     [[nodiscard]] Value ParseValue();
     [[nodiscard]] std::string ParseIdentifier(const char* what);

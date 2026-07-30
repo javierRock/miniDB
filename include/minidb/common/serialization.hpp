@@ -26,11 +26,20 @@ void WriteU32(std::span<std::byte> buffer, std::size_t offset, std::uint32_t val
 void WriteU64(std::span<std::byte> buffer, std::size_t offset, std::uint64_t value);
 void WriteI32(std::span<std::byte> buffer, std::size_t offset, std::int32_t value);
 
+/// Writes the IEEE 754 binary32 bit pattern of `value`, little-endian.
+///
+/// The bits are obtained with std::bit_cast, not by reinterpreting a float*: the
+/// cast is well defined, whereas type-punning through a pointer is not, and it
+/// keeps the format explicit rather than dependent on how the compiler happens to
+/// lay a float out.
+void WriteF32(std::span<std::byte> buffer, std::size_t offset, float value);
+
 [[nodiscard]] std::uint8_t ReadU8(std::span<const std::byte> buffer, std::size_t offset);
 [[nodiscard]] std::uint16_t ReadU16(std::span<const std::byte> buffer, std::size_t offset);
 [[nodiscard]] std::uint32_t ReadU32(std::span<const std::byte> buffer, std::size_t offset);
 [[nodiscard]] std::uint64_t ReadU64(std::span<const std::byte> buffer, std::size_t offset);
 [[nodiscard]] std::int32_t ReadI32(std::span<const std::byte> buffer, std::size_t offset);
+[[nodiscard]] float ReadF32(std::span<const std::byte> buffer, std::size_t offset);
 
 /// A string is stored as a uint16 byte count followed by that many raw bytes.
 /// The length counts UTF-8 *bytes*, not characters, so 'Ciencia de la
@@ -47,6 +56,12 @@ std::size_t WriteString(std::span<std::byte> buffer, std::size_t offset, const s
 /// Bytes occupied by WriteString for a given string.
 [[nodiscard]] inline std::size_t StringSize(const std::string& value) {
     return sizeof(std::uint16_t) + value.size();
+}
+
+/// Bytes occupied by a vector of `dimension` components: a uint16 dimension
+/// followed by that many 32-bit floats.
+[[nodiscard]] inline std::size_t VectorSize(std::size_t dimension) {
+    return sizeof(std::uint16_t) + dimension * sizeof(float);
 }
 
 }  // namespace serialization

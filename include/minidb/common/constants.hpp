@@ -24,12 +24,27 @@ inline constexpr std::uint16_t kFormatVersion = 1;
 inline constexpr std::uint32_t kFileHeaderPageId = 0;
 inline constexpr std::uint32_t kCatalogPageId = 1;
 
-/// Schema bounds. Together they prove that a valid record always fits in an
-/// empty page: 8 * (2 + 255) = 2056 bytes, well under the 4080 bytes available
-/// after the 12-byte page header and one 4-byte slot.
+/// Largest record the slotted page layout can hold: a whole page minus its
+/// 12-byte header and one 4-byte slot. TablePage re-exports this value and
+/// static_asserts that its own layout constants agree with it.
+inline constexpr std::size_t kMaxRecordSize = kPageSize - 12 - 4;
+
+/// Schema bounds. For INT and VARCHAR alone they prove that a valid record
+/// always fits in an empty page: 8 * (2 + 255) = 2056 bytes, well under
+/// kMaxRecordSize.
 inline constexpr std::size_t kMaxColumns = 8;
 inline constexpr std::size_t kMaxVarcharLength = 255;
 inline constexpr std::size_t kMaxIdentifierLength = 32;
+
+/// Largest dimension a VECTOR column may declare. A vector costs
+/// 2 + 4 * dimension bytes, so 1000 dimensions is 4002 bytes and still fits in
+/// an empty page on its own.
+///
+/// Unlike VARCHAR, this bound is not enough by itself: two VECTOR(1000) columns
+/// in the same table would not fit. That is why the Schema constructor also
+/// checks the total against kMaxRecordSize, which restores the invariant that no
+/// valid record can ever fail to fit in an empty page.
+inline constexpr std::size_t kMaxVectorDimension = 1000;
 
 /// Default number of frames held in RAM by the buffer pool. Overridable from
 /// minidb.conf. The worst-case operation (an UPDATE that relocates a record)

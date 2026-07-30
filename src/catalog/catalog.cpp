@@ -89,8 +89,18 @@ void Catalog::Load() {
         const std::size_t base = kOffsetColumns + kColumnStride * i;
         Column column;
         column.name = serialization::ReadString(page, base);
-        column.type = static_cast<ColumnType>(
-            serialization::ReadU8(page, base + kTableNameFieldSize));
+
+        // The type byte is validated here rather than trusted: casting an
+        // unknown value into the enum would produce a Column that every switch
+        // in the system would silently mishandle.
+        const std::uint8_t type_byte = serialization::ReadU8(page, base + kTableNameFieldSize);
+        if (type_byte != static_cast<std::uint8_t>(ColumnType::kInteger) &&
+            type_byte != static_cast<std::uint8_t>(ColumnType::kVarchar) &&
+            type_byte != static_cast<std::uint8_t>(ColumnType::kVector)) {
+            throw StorageError("El catálogo declara un tipo de columna desconocido (" +
+                               std::to_string(type_byte) + ") en la columna '" + column.name + "'");
+        }
+        column.type = static_cast<ColumnType>(type_byte);
         column.max_length = serialization::ReadU16(page, base + kTableNameFieldSize + 1);
         column.is_primary_key =
             (serialization::ReadU8(page, base + kTableNameFieldSize + 3) & kFlagPrimaryKey) != 0;

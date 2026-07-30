@@ -45,6 +45,17 @@ struct GroupByClause {
     std::string column;
 };
 
+/// A nearest neighbour query: `NEAREST <col> TO [...] [USING <metric>] LIMIT <k>`.
+///
+/// `k` comes from LIMIT and is mandatory: a similarity search without a bound
+/// would rank the whole table, which is never what the query means.
+struct NearestClause {
+    std::string column;
+    Vector query;
+    DistanceMetric metric = DistanceMetric::kEuclidean;
+    std::size_t k = 0;
+};
+
 struct SelectStatement {
     std::string table_name;
     /// Empty means SELECT *, which projects every column in schema order.
@@ -56,10 +67,15 @@ struct SelectStatement {
     std::optional<Condition> where;
     std::optional<GroupByClause> group_by;
     std::optional<OrderByClause> order_by;
+    std::optional<NearestClause> nearest;
 };
 
 /// Output column name the aggregate operator gives to its counter.
 inline constexpr const char* kCountStarColumn = "COUNT(*)";
+
+/// Output column name the nearest neighbour operators give to the computed
+/// distance. Like COUNT(*), it cannot collide with a real column.
+inline constexpr const char* kDistanceColumn = "distancia";
 
 struct UpdateStatement {
     std::string table_name;
