@@ -181,6 +181,40 @@ std::optional<Condition> Parser::ParseOptionalWhere() {
     return condition;
 }
 
+std::string Parser::ParseSelectItem() {
+    if (Match(TokenType::kCount)) {
+        Expect(TokenType::kLeftParenthesis);
+        Expect(TokenType::kAsterisk);
+        Expect(TokenType::kRightParenthesis);
+        return kCountStarColumn;
+    }
+    return ParseIdentifier("columna");
+}
+
+std::optional<GroupByClause> Parser::ParseOptionalGroupBy() {
+    if (!Match(TokenType::kGroup)) {
+        return std::nullopt;
+    }
+    Expect(TokenType::kBy);
+    return GroupByClause{ParseIdentifier("columna")};
+}
+
+std::optional<OrderByClause> Parser::ParseOptionalOrderBy() {
+    if (!Match(TokenType::kOrder)) {
+        return std::nullopt;
+    }
+    Expect(TokenType::kBy);
+
+    OrderByClause clause;
+    clause.column = ParseSelectItem();
+    if (Match(TokenType::kDesc)) {
+        clause.descending = true;
+    } else {
+        Match(TokenType::kAsc);  // explicit ASC is allowed and is the default
+    }
+    return clause;
+}
+
 SelectStatement Parser::ParseSelect() {
     Expect(TokenType::kSelect);
 
@@ -189,14 +223,27 @@ SelectStatement Parser::ParseSelect() {
     // the whole schema.
     if (!Match(TokenType::kAsterisk)) {
         do {
-            statement.columns.push_back(ParseIdentifier("columna"));
+            statement.columns.push_back(ParseSelectItem());
         } while (Match(TokenType::kComma));
     }
 
     Expect(TokenType::kFrom);
     statement.table_name = ParseIdentifier("tabla");
     statement.where = ParseOptionalWhere();
+    statement.group_by = ParseOptionalGroupBy();
+    statement.order_by = ParseOptionalOrderBy();
 
+    // With GROUP BY the output columns are the grouping column and COUNT(*),
+    // not the table's columns, so `SELECT *` would be misleading rather than
+    // wrong. Rejecting it here gives a better message than letting the
+    // projection forward two columns the user did not ask for.
+    if (statement.group_by.has_value() && statement.columns.empty()) {
+        throw QueryError(
+            "SELECT * no se admite con GROUP BY: indique las columnas, "
+            "por ejemplo SELECT " +
+            statement.group_by->column + ", COUNT(*) FROM " + statement.table_name + " GROUP BY " +
+            statement.group_by->column);
+    }
     return statement;
 }
 

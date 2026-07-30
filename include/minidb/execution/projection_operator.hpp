@@ -19,7 +19,17 @@ namespace minidb {
 /// diagram look complete.
 class ProjectionOperator : public PhysicalOperator {
 public:
-    /// `columns` empty means every column, in schema order.
+    /// `columns` empty means every input column, in order.
+    ///
+    /// The names come from the child rather than from a schema, so the same
+    /// operator projects a table scan or the output of an aggregate — which is
+    /// what makes `SELECT COUNT(*), career ... GROUP BY career` work without a
+    /// second projection operator.
+    ProjectionOperator(std::unique_ptr<PhysicalOperator> child,
+                       const std::vector<std::string>& input_names,
+                       const std::vector<std::string>& columns);
+
+    /// Convenience overload for a plan whose input is the table itself.
     ProjectionOperator(std::unique_ptr<PhysicalOperator> child, const Schema& schema,
                        const std::vector<std::string>& columns);
 
@@ -31,7 +41,9 @@ public:
     [[nodiscard]] const PhysicalOperator* Child() const override { return child_.get(); }
 
     /// Names of the projected columns, used for the result header.
-    [[nodiscard]] const std::vector<std::string>& OutputColumnNames() const { return names_; }
+    [[nodiscard]] const std::vector<std::string>& OutputColumnNames() const override {
+        return names_;
+    }
 
 private:
     std::unique_ptr<PhysicalOperator> child_;

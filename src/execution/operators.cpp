@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <utility>
 
 #include "minidb/execution/filter_operator.hpp"
@@ -110,28 +111,63 @@ void FilterOperator::Close() { child_->Close(); }
 
 // --- ProjectionOperator --------------------------------------------------
 
+namespace {
+
+/// Case-insensitive lookup of a column name among the child's output names.
+/// Matches Schema::FindColumn, so `SELECT NAME` and `SELECT name` behave alike.
+[[nodiscard]] std::optional<std::size_t> FindName(const std::vector<std::string>& names,
+                                                  const std::string& wanted) {
+    const auto equal_ignoring_case = [](const std::string& left, const std::string& right) {
+        return std::ranges::equal(left, right, [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        });
+    };
+
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (equal_ignoring_case(names[i], wanted)) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::vector<std::string> SchemaColumnNames(const Schema& schema) {
+    std::vector<std::string> names;
+    names.reserve(schema.ColumnCount());
+    for (const Column& column : schema.Columns()) {
+        names.push_back(column.name);
+    }
+    return names;
+}
+
+}  // namespace
+
 ProjectionOperator::ProjectionOperator(std::unique_ptr<PhysicalOperator> child,
-                                       const Schema& schema,
+                                       const std::vector<std::string>& input_names,
                                        const std::vector<std::string>& columns)
     : child_(std::move(child)) {
     if (columns.empty()) {
         // SELECT *: forward records untouched.
         identity_ = true;
-        for (const Column& column : schema.Columns()) {
-            names_.push_back(column.name);
-        }
+        names_ = input_names;
         return;
     }
 
     for (const std::string& name : columns) {
-        const auto index = schema.FindColumn(name);
+        const auto index = FindName(input_names, name);
         if (!index.has_value()) {
-            throw QueryError("No existe la columna '" + name + "' en la tabla");
+            throw QueryError("No existe la columna '" + name + "' en el resultado");
         }
         indices_.push_back(*index);
-        names_.push_back(schema.GetColumn(*index).name);
+        names_.push_back(input_names[*index]);
     }
 }
+
+ProjectionOperator::ProjectionOperator(std::unique_ptr<PhysicalOperator> child,
+                                       const Schema& schema,
+                                       const std::vector<std::string>& columns)
+    : ProjectionOperator(std::move(child), SchemaColumnNames(schema), columns) {}
 
 void ProjectionOperator::Open() { child_->Open(); }
 

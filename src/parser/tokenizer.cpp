@@ -19,7 +19,10 @@ const std::unordered_map<std::string, TokenType>& Keywords() {
         {"UPDATE", TokenType::kUpdate}, {"SET", TokenType::kSet},
         {"DELETE", TokenType::kDelete}, {"INT", TokenType::kInt},
         {"VARCHAR", TokenType::kVarchar}, {"PRIMARY", TokenType::kPrimary},
-        {"KEY", TokenType::kKey},
+        {"KEY", TokenType::kKey},       {"ORDER", TokenType::kOrder},
+        {"GROUP", TokenType::kGroup},   {"BY", TokenType::kBy},
+        {"ASC", TokenType::kAsc},       {"DESC", TokenType::kDesc},
+        {"COUNT", TokenType::kCount},
     };
     return keywords;
 }
@@ -63,6 +66,12 @@ std::string TokenTypeName(TokenType type) {
         case TokenType::kVarchar: return "VARCHAR";
         case TokenType::kPrimary: return "PRIMARY";
         case TokenType::kKey: return "KEY";
+        case TokenType::kOrder: return "ORDER";
+        case TokenType::kGroup: return "GROUP";
+        case TokenType::kBy: return "BY";
+        case TokenType::kAsc: return "ASC";
+        case TokenType::kDesc: return "DESC";
+        case TokenType::kCount: return "COUNT";
         case TokenType::kEqual: return "'='";
         case TokenType::kNotEqual: return "'!='";
         case TokenType::kLess: return "'<'";

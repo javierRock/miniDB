@@ -1,6 +1,8 @@
 #pragma once
 
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "minidb/storage/record.hpp"
 
@@ -46,6 +48,22 @@ public:
     /// The operator this one pulls from, or nullptr for a leaf. Lets a plan be
     /// walked and described without knowing what it is made of.
     [[nodiscard]] virtual const PhysicalOperator* Child() const { return nullptr; }
+
+    /// Names of the columns this operator produces.
+    ///
+    /// Only the operators that reshape the tuple know them: Projection and
+    /// Aggregate override this. Filter and Sort pass their child's names
+    /// through, and a scan returns nothing because it does not hold a schema —
+    /// the planner is the one that owns schema knowledge and hands names to
+    /// whoever needs them.
+    ///
+    /// It lets the engine read the result header off the root of any plan
+    /// without knowing which operator ended up on top.
+    [[nodiscard]] virtual const std::vector<std::string>& OutputColumnNames() const {
+        static const std::vector<std::string> kNoNames;
+        const PhysicalOperator* child = Child();
+        return child != nullptr ? child->OutputColumnNames() : kNoNames;
+    }
 };
 
 }  // namespace minidb

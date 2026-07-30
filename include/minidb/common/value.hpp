@@ -21,4 +21,14 @@ using Value = std::variant<std::int32_t, std::string>;
 /// Throws QueryError when the types differ.
 [[nodiscard]] bool CompareValues(const Value& left, CompareOperator op, const Value& right);
 
+/// Strict weak ordering over values of the same type, for std::sort and std::map.
+///
+/// It exists so the sort and the aggregate operators share one definition of
+/// "less than" instead of each writing its own comparator.
+struct ValueLess {
+    [[nodiscard]] bool operator()(const Value& left, const Value& right) const {
+        return CompareValues(left, CompareOperator::kLess, right);
+    }
+};
+
 }  // namespace minidb

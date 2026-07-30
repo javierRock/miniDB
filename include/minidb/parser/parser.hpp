@@ -22,11 +22,15 @@ namespace minidb {
 ///   create      := CREATE TABLE name '(' column {',' column} ')'
 ///   column      := name (INT | VARCHAR '(' int ')') [PRIMARY KEY]
 ///   insert      := INSERT INTO name VALUES '(' value {',' value} ')'
-///   select      := SELECT ('*' | name {',' name}) FROM name [where]
+///   select      := SELECT ('*' | item {',' item}) FROM name [where]
+///                         [group_by] [order_by]
+///   item        := name | COUNT '(' '*' ')'
 ///   update      := UPDATE name SET assign {',' assign} [where]
 ///   delete      := DELETE FROM name [where]
 ///   assign      := name '=' value
 ///   where       := WHERE name op value
+///   group_by    := GROUP BY name
+///   order_by    := ORDER BY (name | COUNT '(' '*' ')') [ASC | DESC]
 ///   op          := '=' | '!=' | '<' | '<=' | '>' | '>='
 ///   value       := int | string
 class Parser {
@@ -53,6 +57,10 @@ private:
 
     [[nodiscard]] Column ParseColumnDefinition();
     [[nodiscard]] std::optional<Condition> ParseOptionalWhere();
+    [[nodiscard]] std::optional<GroupByClause> ParseOptionalGroupBy();
+    [[nodiscard]] std::optional<OrderByClause> ParseOptionalOrderBy();
+    /// A column name or COUNT(*), which yields the pseudo-name "COUNT(*)".
+    [[nodiscard]] std::string ParseSelectItem();
     [[nodiscard]] CompareOperator ParseCompareOperator();
     [[nodiscard]] Value ParseValue();
     [[nodiscard]] std::string ParseIdentifier(const char* what);

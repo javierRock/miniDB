@@ -207,6 +207,79 @@ TEST(ParserTest, ParsesSelectWithAStringCondition) {
     EXPECT_EQ(std::get<std::string>(select.where->value), "Ingeniería de Sistemas");
 }
 
+// --- ORDER BY and GROUP BY -----------------------------------------------
+
+TEST(ParserTest, ParsesOrderByWithAndWithoutADirection) {
+    struct Case {
+        std::string sql;
+        bool descending;
+    };
+    const Case cases[] = {
+        {"SELECT * FROM t ORDER BY age", false},
+        {"SELECT * FROM t ORDER BY age ASC", false},
+        {"SELECT * FROM t ORDER BY age DESC", true},
+        {"SELECT * FROM t order by age desc", true},
+    };
+
+    for (const Case& test_case : cases) {
+        const auto select = As<SelectStatement>(Parser::Parse(test_case.sql));
+        ASSERT_TRUE(select.order_by.has_value()) << test_case.sql;
+        EXPECT_EQ(select.order_by->column, "age") << test_case.sql;
+        EXPECT_EQ(select.order_by->descending, test_case.descending) << test_case.sql;
+    }
+}
+
+TEST(ParserTest, ParsesGroupByWithCountStar) {
+    const auto select =
+        As<SelectStatement>(Parser::Parse("SELECT career, COUNT(*) FROM students GROUP BY career"));
+
+    ASSERT_EQ(select.columns.size(), 2u);
+    EXPECT_EQ(select.columns[0], "career");
+    // COUNT(*) travels as a pseudo-column name, so no special case is needed
+    // anywhere below the parser.
+    EXPECT_EQ(select.columns[1], "COUNT(*)");
+    ASSERT_TRUE(select.group_by.has_value());
+    EXPECT_EQ(select.group_by->column, "career");
+    EXPECT_FALSE(select.order_by.has_value());
+}
+
+TEST(ParserTest, ParsesCountStarWithoutGroupBy) {
+    const auto select = As<SelectStatement>(Parser::Parse("SELECT COUNT(*) FROM students"));
+
+    ASSERT_EQ(select.columns.size(), 1u);
+    EXPECT_EQ(select.columns[0], "COUNT(*)");
+    EXPECT_FALSE(select.group_by.has_value());
+}
+
+TEST(ParserTest, ParsesWhereGroupByAndOrderByTogether) {
+    const auto select = As<SelectStatement>(
+        Parser::Parse("SELECT career, COUNT(*) FROM students WHERE age >= 20 "
+                      "GROUP BY career ORDER BY COUNT(*) DESC"));
+
+    ASSERT_TRUE(select.where.has_value());
+    ASSERT_TRUE(select.group_by.has_value());
+    ASSERT_TRUE(select.order_by.has_value());
+    EXPECT_EQ(select.order_by->column, "COUNT(*)");
+    EXPECT_TRUE(select.order_by->descending);
+}
+
+TEST(ParserTest, RejectsMalformedOrderByAndGroupBy) {
+    EXPECT_THROW((void)Parser::Parse("SELECT * FROM t ORDER BY"), QueryError);
+    EXPECT_THROW((void)Parser::Parse("SELECT * FROM t ORDER age"), QueryError);
+    EXPECT_THROW((void)Parser::Parse("SELECT career, COUNT(*) FROM t GROUP career"), QueryError);
+    EXPECT_THROW((void)Parser::Parse("SELECT COUNT FROM t"), QueryError);
+    EXPECT_THROW((void)Parser::Parse("SELECT COUNT() FROM t"), QueryError);
+    // ORDER BY has to come after GROUP BY, as in standard SQL.
+    EXPECT_THROW((void)Parser::Parse("SELECT career, COUNT(*) FROM t ORDER BY career GROUP BY career"),
+                 QueryError);
+}
+
+/// With GROUP BY the result columns are the group and its count, so `SELECT *`
+/// would name columns the query cannot produce.
+TEST(ParserTest, RejectsSelectStarWithGroupBy) {
+    EXPECT_THROW((void)Parser::Parse("SELECT * FROM students GROUP BY career"), QueryError);
+}
+
 // --- UPDATE and DELETE ---------------------------------------------------
 
 TEST(ParserTest, ParsesUpdate) {

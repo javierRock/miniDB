@@ -1,11 +1,14 @@
 #include "minidb/execution/execution_engine.hpp"
 
+#include <algorithm>
 #include <utility>
 
+#include "minidb/execution/aggregate_operator.hpp"
 #include "minidb/execution/filter_operator.hpp"
 #include "minidb/execution/index_scan_operator.hpp"
 #include "minidb/execution/projection_operator.hpp"
 #include "minidb/execution/sequential_scan_operator.hpp"
+#include "minidb/execution/sort_operator.hpp"
 
 namespace minidb {
 namespace {
@@ -47,8 +50,38 @@ std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildScan(
 }
 
 std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildPlan(const SelectStatement& select) const {
-    return std::make_unique<ProjectionOperator>(BuildScan(select.where), catalog_.GetSchema(),
-                                                select.columns);
+    const Schema& schema = catalog_.GetSchema();
+
+    std::unique_ptr<PhysicalOperator> plan = BuildScan(select.where);
+    // What the operator above sees. It starts as the table's columns and changes
+    // only where an operator reshapes the tuple, which is what lets ORDER BY be
+    // resolved by one uniform rule: against the columns its child produces.
+    std::vector<std::string> input_names;
+    for (const Column& column : schema.Columns()) {
+        input_names.push_back(column.name);
+    }
+
+    if (select.group_by.has_value()) {
+        auto aggregate = std::make_unique<AggregateOperator>(std::move(plan), input_names,
+                                                             select.group_by->column);
+        input_names = aggregate->OutputColumnNames();
+        plan = std::move(aggregate);
+    } else if (std::ranges::find(select.columns, kCountStarColumn) != select.columns.end()) {
+        // COUNT(*) without GROUP BY: a single group over the whole table.
+        auto aggregate = std::make_unique<AggregateOperator>(std::move(plan));
+        input_names = aggregate->OutputColumnNames();
+        plan = std::move(aggregate);
+    }
+
+    if (select.order_by.has_value()) {
+        // Sorting sits directly under the projection, so ORDER BY may name a
+        // column that is not projected. With GROUP BY it sits above the
+        // aggregate instead, so it can order by the group or by COUNT(*).
+        plan = std::make_unique<SortOperator>(std::move(plan), input_names,
+                                             select.order_by->column, select.order_by->descending);
+    }
+
+    return std::make_unique<ProjectionOperator>(std::move(plan), input_names, select.columns);
 }
 
 std::vector<std::string> ExecutionEngine::DescribePlan(const PhysicalOperator& root) {
@@ -113,8 +146,9 @@ QueryResult ExecutionEngine::ExecuteSelect(const SelectStatement& statement) {
     std::unique_ptr<PhysicalOperator> plan = BuildPlan(statement);
     QueryResult result;
     result.plan = DescribePlan(*plan);
-    result.column_names =
-        static_cast<ProjectionOperator&>(*plan).OutputColumnNames();
+    // The root knows its own header, so the engine does not have to assume which
+    // operator ended up on top.
+    result.column_names = plan->OutputColumnNames();
 
     plan->Open();
     while (auto record = plan->Next()) {

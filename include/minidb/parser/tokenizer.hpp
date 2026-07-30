@@ -28,6 +28,12 @@ enum class TokenType {
     kVarchar,
     kPrimary,
     kKey,
+    kOrder,
+    kGroup,
+    kBy,
+    kAsc,
+    kDesc,
+    kCount,
 
     // Comparison operators
     kEqual,

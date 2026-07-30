@@ -50,6 +50,7 @@ add_library(minidb_core
     src/parser/tokenizer.cpp
     src/parser/parser.cpp
     src/execution/operators.cpp
+    src/execution/blocking_operators.cpp
     src/execution/execution_engine.cpp
     src/database/database.cpp)
 
@@ -75,6 +76,7 @@ if(MINIDB_BUILD_TESTS)
         tests/hash_index_test.cpp
         tests/parser_test.cpp
         tests/volcano_test.cpp
+        tests/blocking_operators_test.cpp
         tests/integration_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)
