@@ -47,7 +47,7 @@ public:
     Database(const Database&) = delete;
     Database& operator=(const Database&) = delete;
 
-    /// Parses and runs one SQL statement.
+    /// Parses and runs one SQL statement, measuring what it cost.
     [[nodiscard]] QueryResult Execute(const std::string& sql);
 
     /// Writes every dirty page and the catalog to disk.
@@ -65,6 +65,8 @@ public:
     [[nodiscard]] std::uint32_t IndexPageCount() const;
 
 private:
+    /// The statement itself, without the measuring. Execute wraps it.
+    [[nodiscard]] QueryResult ExecuteParsed(const std::string& sql);
     [[nodiscard]] QueryResult CreateTable(const CreateTableStatement& statement);
     void OpenExistingTable();
 

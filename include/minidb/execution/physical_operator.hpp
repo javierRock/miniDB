@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -7,6 +8,18 @@
 #include "minidb/storage/record.hpp"
 
 namespace minidb {
+
+/// What one operator did during a run, for the plan the CLI prints.
+///
+/// `next_calls` counts how many times the operator above pulled from it and
+/// `rows_produced` how many of those calls returned a record. The difference
+/// between a filter's rows and its child's calls is the number of records the
+/// filter had to read and throw away, which is the cost an index avoids.
+struct OperatorMetrics {
+    std::string name;
+    std::uint64_t next_calls = 0;
+    std::uint64_t rows_produced = 0;
+};
 
 /// Base class of every physical operator, following the Volcano model.
 ///
@@ -64,6 +77,30 @@ public:
         const PhysicalOperator* child = Child();
         return child != nullptr ? child->OutputColumnNames() : kNoNames;
     }
+
+    /// What this operator did. The counters accumulate over its lifetime, and
+    /// since a plan is built fresh for each statement, that is per statement.
+    [[nodiscard]] OperatorMetrics Metrics() const {
+        return OperatorMetrics{Name(), next_calls_, rows_produced_};
+    }
+
+protected:
+    /// Counts one Next() call and its outcome.
+    ///
+    /// Operators return their record through this instead of incrementing two
+    /// counters by hand, so a new operator cannot end up missing from the plan's
+    /// measurements.
+    [[nodiscard]] std::optional<Record> Counted(std::optional<Record> record) {
+        ++next_calls_;
+        if (record.has_value()) {
+            ++rows_produced_;
+        }
+        return record;
+    }
+
+private:
+    std::uint64_t next_calls_ = 0;
+    std::uint64_t rows_produced_ = 0;
 };
 
 }  // namespace minidb

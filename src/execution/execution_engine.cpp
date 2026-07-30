@@ -84,16 +84,15 @@ std::unique_ptr<PhysicalOperator> ExecutionEngine::BuildPlan(const SelectStateme
     return std::make_unique<ProjectionOperator>(std::move(plan), input_names, select.columns);
 }
 
-std::vector<std::string> ExecutionEngine::DescribePlan(const PhysicalOperator& root) {
-    std::vector<std::string> names;
+void ExecutionEngine::DescribePlan(const PhysicalOperator& root, QueryResult& result) {
     for (const PhysicalOperator* op = &root; op != nullptr; op = op->Child()) {
-        names.push_back(op->Name());
+        result.plan.push_back(op->Name());
+        result.metrics.push_back(op->Metrics());
     }
-    return names;
 }
 
 std::vector<RecordId> ExecutionEngine::CollectMatchingRecordIds(
-    const std::optional<Condition>& where) const {
+    const std::optional<Condition>& where, QueryResult& result) const {
     std::unique_ptr<PhysicalOperator> plan = BuildScan(where);
     std::vector<RecordId> rids;
 
@@ -102,6 +101,7 @@ std::vector<RecordId> ExecutionEngine::CollectMatchingRecordIds(
         rids.push_back(plan->LastRecordId());
     }
     plan->Close();
+    DescribePlan(*plan, result);
     // The plan is finished and every page it touched is released before the
     // caller starts modifying anything.
     return rids;
@@ -145,7 +145,6 @@ QueryResult ExecutionEngine::ExecuteSelect(const SelectStatement& statement) {
 
     std::unique_ptr<PhysicalOperator> plan = BuildPlan(statement);
     QueryResult result;
-    result.plan = DescribePlan(*plan);
     // The root knows its own header, so the engine does not have to assume which
     // operator ended up on top.
     result.column_names = plan->OutputColumnNames();
@@ -155,6 +154,9 @@ QueryResult ExecutionEngine::ExecuteSelect(const SelectStatement& statement) {
         result.rows.push_back(std::move(*record));
     }
     plan->Close();
+
+    // After running, so the counters describe the run that just happened.
+    DescribePlan(*plan, result);
 
     result.affected_rows = result.rows.size();
     result.message = RowsMessage(result.rows.size(), "devuelta");
@@ -180,7 +182,8 @@ QueryResult ExecutionEngine::ExecuteUpdate(const UpdateStatement& statement) {
     }
 
     // Phase one: find the rows using the query pipeline, then let it go.
-    const std::vector<RecordId> targets = CollectMatchingRecordIds(statement.where);
+    QueryResult result;
+    const std::vector<RecordId> targets = CollectMatchingRecordIds(statement.where, result);
 
     // Phase two: modify, with no scan open over the pages being rewritten.
     std::uint64_t updated = 0;
@@ -206,7 +209,6 @@ QueryResult ExecutionEngine::ExecuteUpdate(const UpdateStatement& statement) {
         ++updated;
     }
 
-    QueryResult result;
     result.affected_rows = updated;
     result.message = RowsMessage(updated, "actualizada");
     return result;
@@ -216,7 +218,8 @@ QueryResult ExecutionEngine::ExecuteDelete(const DeleteStatement& statement) {
     catalog_.RequireTable(statement.table_name);
     const Schema& schema = catalog_.GetSchema();
 
-    const std::vector<RecordId> targets = CollectMatchingRecordIds(statement.where);
+    QueryResult result;
+    const std::vector<RecordId> targets = CollectMatchingRecordIds(statement.where, result);
 
     std::uint64_t deleted = 0;
     for (RecordId rid : targets) {
@@ -235,7 +238,6 @@ QueryResult ExecutionEngine::ExecuteDelete(const DeleteStatement& statement) {
         }
     }
 
-    QueryResult result;
     result.affected_rows = deleted;
     result.message = RowsMessage(deleted, "eliminada");
     return result;

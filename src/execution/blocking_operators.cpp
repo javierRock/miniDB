@@ -67,9 +67,9 @@ void SortOperator::Open() {
 
 std::optional<Record> SortOperator::Next() {
     if (position_ >= rows_.size()) {
-        return std::nullopt;
+        return Counted(std::nullopt);
     }
-    return rows_[position_++];
+    return Counted(rows_[position_++]);
 }
 
 void SortOperator::Close() {
@@ -124,7 +124,7 @@ void AggregateOperator::Open() {
 
 std::optional<Record> AggregateOperator::Next() {
     if (position_ >= groups_.size()) {
-        return std::nullopt;
+        return Counted(std::nullopt);
     }
     const auto& [key, count] = groups_[position_++];
 
@@ -137,7 +137,7 @@ std::optional<Record> AggregateOperator::Next() {
         values.push_back(key);
     }
     values.push_back(counted);
-    return Record(std::move(values));
+    return Counted(Record(std::move(values)));
 }
 
 void AggregateOperator::Close() {

@@ -23,10 +23,10 @@ std::optional<Record> SequentialScanOperator::Next() {
 
     auto row = iterator_->Next();
     if (!row.has_value()) {
-        return std::nullopt;
+        return Counted(std::nullopt);
     }
     last_rid_ = row->first;
-    return std::move(row->second);
+    return Counted(std::move(row->second));
 }
 
 void SequentialScanOperator::Close() {
@@ -44,13 +44,13 @@ void IndexScanOperator::Open() {
 std::optional<Record> IndexScanOperator::Next() {
     // The primary key is unique, so this operator yields at most one record.
     if (consumed_) {
-        return std::nullopt;
+        return Counted(std::nullopt);
     }
     consumed_ = true;
 
     const std::optional<RecordId> rid = index_.Search(key_);
     if (!rid.has_value()) {
-        return std::nullopt;
+        return Counted(std::nullopt);
     }
 
     std::optional<Record> record = heap_.GetRecord(*rid);
@@ -64,7 +64,7 @@ std::optional<Record> IndexScanOperator::Next() {
     }
 
     last_rid_ = *rid;
-    return record;
+    return Counted(std::move(record));
 }
 
 void IndexScanOperator::Close() {
@@ -101,10 +101,10 @@ std::optional<Record> FilterOperator::Next() {
     // Pull until something matches; the child streams, so nothing accumulates.
     while (auto record = child_->Next()) {
         if (CompareValues(record->GetValue(column_index_), condition_.op, condition_.value)) {
-            return record;
+            return Counted(std::move(record));
         }
     }
-    return std::nullopt;
+    return Counted(std::nullopt);
 }
 
 void FilterOperator::Close() { child_->Close(); }
@@ -174,7 +174,7 @@ void ProjectionOperator::Open() { child_->Open(); }
 std::optional<Record> ProjectionOperator::Next() {
     auto record = child_->Next();
     if (!record.has_value() || identity_) {
-        return record;
+        return Counted(std::move(record));
     }
 
     std::vector<Value> projected;
@@ -182,7 +182,7 @@ std::optional<Record> ProjectionOperator::Next() {
     for (std::size_t index : indices_) {
         projected.push_back(record->GetValue(index));
     }
-    return Record(std::move(projected));
+    return Counted(Record(std::move(projected)));
 }
 
 void ProjectionOperator::Close() { child_->Close(); }

@@ -22,6 +22,19 @@ struct QueryResult {
     std::string message;
     /// Operator names from the root down, so the plan can be shown and tested.
     std::vector<std::string> plan;
+    /// The same plan with the counters each operator gathered while running.
+    std::vector<OperatorMetrics> metrics;
+
+    /// What the statement cost. Filled by Database, which is where the clock and
+    /// the buffer pool statistics are both in reach.
+    ///
+    /// `pages_read` is the number the two access paths differ on the most, and
+    /// unlike the wall clock it is deterministic: the same query over the same
+    /// data always reads the same pages.
+    double elapsed_ms = 0.0;
+    std::uint64_t pages_read = 0;
+    std::uint64_t buffer_hits = 0;
+    std::uint64_t buffer_misses = 0;
 };
 
 /// Turns a parsed statement into work against the storage layer.
@@ -59,15 +72,20 @@ private:
 
     /// Runs a plan to completion and returns the location of every record it
     /// produced. This is phase one of UPDATE and DELETE.
+    ///
+    /// It also describes the plan into `result`, so a statement that modifies
+    /// rows reports which access path it used to find them, exactly as a SELECT
+    /// does.
     [[nodiscard]] std::vector<RecordId> CollectMatchingRecordIds(
-        const std::optional<Condition>& where) const;
+        const std::optional<Condition>& where, QueryResult& result) const;
 
     /// True when the condition is `<primary key> = <literal>`, the only shape a
     /// hash index can answer.
     [[nodiscard]] bool CanUseIndex(const std::optional<Condition>& where) const;
 
-    /// Operator names from the root down, walked through Child().
-    [[nodiscard]] static std::vector<std::string> DescribePlan(const PhysicalOperator& root);
+    /// Walks the plan through Child() and fills in both descriptions of it: the
+    /// operator names and their counters.
+    static void DescribePlan(const PhysicalOperator& root, QueryResult& result);
 
     Catalog& catalog_;
     TableHeap& heap_;

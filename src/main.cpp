@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <exception>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -72,30 +73,47 @@ void PrintRows(const QueryResult& result) {
     std::cout << separator() << '\n';
 }
 
+/// Prints the plan as a tree, with what each operator did.
+///
+/// The counters are what make the difference between access paths visible: the
+/// same query answered by an index scan pulls two records, while a sequential
+/// scan plus filter pulls the whole table and throws nearly all of it away.
 void PrintPlan(const QueryResult& result) {
-    if (result.plan.empty()) {
+    if (result.metrics.empty()) {
         return;
     }
-    std::cout << "Plan físico (modelo Volcano): ";
-    for (std::size_t i = 0; i < result.plan.size(); ++i) {
-        std::cout << result.plan[i];
-        if (i + 1 < result.plan.size()) {
-            std::cout << " <- ";
-        }
+
+    std::cout << "Plan físico (modelo Volcano):\n";
+    for (std::size_t i = 0; i < result.metrics.size(); ++i) {
+        const OperatorMetrics& op = result.metrics[i];
+        // The root is at the top and each child is indented under its parent, so
+        // the tree reads in the direction the records travel: bottom to top.
+        const std::string branch = (i == 0) ? "  " : std::string(2 * i, ' ') + "└─ ";
+        std::cout << Pad(branch + op.name, 40) << "filas=" << op.rows_produced
+                  << "  next=" << op.next_calls << '\n';
     }
-    std::cout << '\n';
+}
+
+/// One line with what the statement cost, in time and in pages read.
+void PrintCost(const QueryResult& result) {
+    std::cout << "Tiempo: " << std::fixed << std::setprecision(3) << result.elapsed_ms
+              << " ms | páginas leídas del disco: " << result.pages_read << " | buffer "
+              << result.buffer_hits << '/' << result.buffer_misses << " (aciertos/fallos)\n";
+    std::cout.unsetf(std::ios::fixed);
 }
 
 void PrintHelp() {
     std::cout << R"(SQL admitido:
   CREATE TABLE <tabla> (<col> INT [PRIMARY KEY] | <col> VARCHAR(<n>), ...);
   INSERT INTO <tabla> VALUES (<v1>, <v2>, ...);
-  SELECT * | <col>, ... FROM <tabla> [WHERE <col> <op> <valor>];
+  SELECT * | <col> | COUNT(*), ... FROM <tabla> [WHERE <col> <op> <valor>]
+         [GROUP BY <col>] [ORDER BY <col> [ASC|DESC]];
   UPDATE <tabla> SET <col> = <valor> [, ...] [WHERE <col> <op> <valor>];
   DELETE FROM <tabla> [WHERE <col> <op> <valor>];
 
 Operadores de comparación: =  !=  <  <=  >  >=
 Las palabras clave no distinguen mayúsculas; el ';' final es opcional.
+Tras cada sentencia se muestra el plan físico, el tiempo y las páginas leídas.
 
 Comandos internos:
   .help     Esta ayuda
@@ -110,7 +128,8 @@ Ejemplos:
   CREATE TABLE students (id INT PRIMARY KEY, name VARCHAR(50), age INT, career VARCHAR(50));
   INSERT INTO students VALUES (1, 'Ana', 20, 'Ciencia de la Computación');
   SELECT * FROM students WHERE id = 1;
-  SELECT * FROM students WHERE age >= 20;
+  SELECT * FROM students WHERE age >= 20 ORDER BY age DESC;
+  SELECT career, COUNT(*) FROM students GROUP BY career;
 )";
 }
 
@@ -274,7 +293,9 @@ int RunSession(std::istream& input, Database& db, const std::filesystem::path& c
             const QueryResult result = db.Execute(sql);
             PrintPlan(result);
             PrintRows(result);
-            std::cout << result.message << "\n\n";
+            std::cout << result.message << '\n';
+            PrintCost(result);
+            std::cout << '\n';
         } catch (const QueryError& error) {
             std::cout << "Error: " << error.what() << "\n\n";
         }

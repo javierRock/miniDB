@@ -77,6 +77,7 @@ if(MINIDB_BUILD_TESTS)
         tests/parser_test.cpp
         tests/volcano_test.cpp
         tests/blocking_operators_test.cpp
+        tests/evaluation_test.cpp
         tests/integration_test.cpp)
 
     foreach(test_source IN LISTS MINIDB_TEST_SOURCES)

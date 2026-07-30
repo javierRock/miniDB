@@ -1,6 +1,7 @@
 #include "minidb/database/database.hpp"
 
 #include <charconv>
+#include <chrono>
 #include <fstream>
 #include <utility>
 
@@ -121,6 +122,25 @@ QueryResult Database::CreateTable(const CreateTableStatement& statement) {
 }
 
 QueryResult Database::Execute(const std::string& sql) {
+    // Measured here rather than inside the engine so the reported time covers
+    // parsing too, which is what the user actually waited for, and so the engine
+    // keeps knowing nothing about clocks.
+    const BufferPoolStatistics before = pool_->Statistics();
+    const auto started = std::chrono::steady_clock::now();
+
+    QueryResult result = ExecuteParsed(sql);
+
+    const auto finished = std::chrono::steady_clock::now();
+    const BufferPoolStatistics after = pool_->Statistics();
+
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(finished - started).count();
+    result.pages_read = after.disk_reads - before.disk_reads;
+    result.buffer_hits = after.hits - before.hits;
+    result.buffer_misses = after.misses - before.misses;
+    return result;
+}
+
+QueryResult Database::ExecuteParsed(const std::string& sql) {
     Statement statement = Parser::Parse(sql);
 
     // CREATE TABLE is handled here rather than in the engine, because it brings
